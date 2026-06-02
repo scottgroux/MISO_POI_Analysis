@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Data store — large, binary, auto-generated
+# Remove these lines if you want to commit data to GitHub (small datasets only)
+data/lmp/
+
+# Plotly chart cache
+.plotly_cache/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

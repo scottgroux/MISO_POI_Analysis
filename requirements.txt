@@ -1,0 +1,22 @@
+# MISO_POI_Analysis — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Data collection & storage
+requests>=2.31.0
+pandas>=2.1.0
+pyarrow>=14.0.0       # Parquet read/write backend
+
+# Scheduling (local dev only — Render Cron handles this in production)
+schedule>=1.2.0
+
+# Analysis
+numpy>=1.26.0
+
+# Chart generation → static HTML for GitHub Pages
+plotly>=5.18.0
+
+# Optional: faster Parquet alternative to pyarrow
+# fastparquet>=2023.10.1
+
+# Optional: timezone handling (pandas uses this under the hood)
+# pytz>=2023.3
