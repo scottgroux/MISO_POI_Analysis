@@ -4,8 +4,9 @@ backfill.py
 Downloads and processes MISO's weekly 5-minute LMP ZIP archives,
 converting them into the same Parquet partition format used by fetch.py.
 
-MISO publishes final (corrected) RT 5-min LMP as weekly ZIPs.
-The filename date is ~2 weeks AFTER the data's actual operating week.
+MISO publishes final (corrected) RT 5-min LMP as weekly ZIPs every Monday.
+The file date is the Monday publish date (~7-8 days after the data week ends).
+Available files are discovered via the MISO market reports search API.
 
 URL pattern:
   https://docs.misoenergy.org/marketreports/YYYYMMDD_5MIN_LMP.zip
@@ -39,15 +40,16 @@ import requests
 
 BASE_URL = "https://docs.misoenergy.org/marketreports/{date}_5MIN_LMP.zip"
 
-# MISO publishes weekly files; the file date is ~14 days after the data week.
-# We step through candidate dates weekly and skip 404s gracefully.
-PUBLISH_LAG_DAYS = 14       # how far ahead the filename date is vs. data date
-STEP_DAYS        = 7        # weekly files
+# MISO market reports Elasticsearch API — used to discover actual file publish dates.
+MISO_SEARCH_URL = (
+    "https://www.misoenergy.org/api/find/Optics_Models_Find_MarketReportItem/_search"
+)
+
 EARLIEST_DATE    = date(2013, 1, 1)   # approx. first available file
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "lmp"
 
-# Column mapping from MISO ZIP CSVs to our schema
+# Column mapping from MISO ZIP CSVs to our schema (named columns in ZIP CSVs)
 RENAME_MAP = {
     "PNODENAME":   "node",
     "MKTHOUR_EST": "interval_est",
@@ -69,14 +71,9 @@ log = logging.getLogger(__name__)
 
 # ── Download & parse ──────────────────────────────────────────────────────────
 
-def build_url(file_date: date) -> str:
-    return BASE_URL.format(date=file_date.strftime("%Y%m%d"))
-
-
-def fetch_zip(file_date: date) -> pd.DataFrame | None:
-    """Download one weekly ZIP and return its contents as a DataFrame.
+def _fetch_zip_url(url: str) -> pd.DataFrame | None:
+    """Download one weekly ZIP by URL and return its contents as a DataFrame.
     Returns None if the file doesn't exist (404) or on network error."""
-    url = build_url(file_date)
     log.info("Fetching %s", url)
 
     try:
@@ -96,7 +93,7 @@ def fetch_zip(file_date: date) -> pd.DataFrame | None:
     try:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             # Find the CSV inside (there should be exactly one)
-            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+            csv_names = [n for n in zf.namelist() if n.upper().endswith(".CSV")]
             if not csv_names:
                 log.warning("No CSV found inside %s", url)
                 return None
@@ -187,22 +184,62 @@ def save_weekly_data(df: pd.DataFrame) -> None:
 
 # ── Date range logic ──────────────────────────────────────────────────────────
 
-def candidate_file_dates(start: date, end: date) -> list[date]:
-    """Return the list of weekly file-dates whose ZIPs likely cover [start, end].
-
-    Because the file date is ~14 days after the data, we add the lag to both
-    ends and then step weekly through that window.
+def fetch_available_urls(start: date, end: date) -> list[str]:
+    """Query the MISO market reports API for all weekly 5-min LMP ZIPs whose
+    publish date falls in the window [start - 14 days, end + 14 days].
+    Returns a sorted list of download URLs.
     """
-    window_start = start + timedelta(days=PUBLISH_LAG_DAYS)
-    window_end   = end   + timedelta(days=PUBLISH_LAG_DAYS + STEP_DAYS)
+    # Add a 14-day buffer on each side so we don't miss files at the edges.
+    window_start = (start - timedelta(days=14)).isoformat()
+    window_end   = (end   + timedelta(days=14)).isoformat()
 
-    # Align to the nearest Monday (MISO tends to publish on Mondays/Tuesdays)
-    # A simple weekly step from window_start is good enough in practice.
+    query = {
+        "query": {
+            "filtered": {
+                "query": {
+                    "term": {"MarketReportName$$string": "Weekly Real-Time 5-Min LMP (zip)"}
+                },
+                "filter": {
+                    "and": [
+                        {"range": {"MarketReportPublished$$string": {
+                            "gte": window_start,
+                            "lte": window_end,
+                        }}}
+                    ]
+                }
+            }
+        },
+        "sort": [{"MarketReportPublished$$string": "asc"}],
+        "size": 200,
+    }
+
+    try:
+        resp = requests.post(MISO_SEARCH_URL, json=query, timeout=30)
+        resp.raise_for_status()
+        hits = resp.json().get("hits", {}).get("hits", [])
+        urls = [
+            h["_source"]["SearchHitUrl$$string"]
+            for h in hits
+            if "SearchHitUrl$$string" in h.get("_source", {})
+        ]
+        log.info("API returned %d matching weekly ZIP files", len(urls))
+        return urls
+    except Exception as e:
+        log.warning("Could not query MISO search API (%s) — falling back to date guessing", e)
+        return _fallback_urls(start, end)
+
+
+def _fallback_urls(start: date, end: date) -> list[str]:
+    """Generate candidate URLs by stepping weekly through the date window.
+    Used if the MISO search API is unavailable.
+    """
     candidates = []
-    d = window_start
-    while d <= window_end:
-        candidates.append(d)
-        d += timedelta(days=STEP_DAYS)
+    # MISO publishes on Mondays ~7-8 days after data week; add a small buffer.
+    d = start + timedelta(days=6)
+    end_window = end + timedelta(days=15)
+    while d <= end_window:
+        candidates.append(BASE_URL.format(date=d.strftime("%Y%m%d")))
+        d += timedelta(days=7)
     return candidates
 
 
@@ -242,18 +279,18 @@ def main() -> None:
 
     log.info("Backfill range: %s → %s", start, end)
 
-    file_dates = candidate_file_dates(start, end)
-    log.info("Candidate ZIP file dates: %d files to try", len(file_dates))
+    urls = fetch_available_urls(start, end)
+    log.info("ZIP files to download: %d", len(urls))
 
     if args.dry_run:
-        for fd in file_dates:
-            print(build_url(fd))
+        for url in urls:
+            print(url)
         return
 
     success, skipped, errors = 0, 0, 0
 
-    for file_date in file_dates:
-        raw = fetch_zip(file_date)
+    for url in urls:
+        raw = _fetch_zip_url(url)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         if raw is None:
