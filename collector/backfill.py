@@ -61,6 +61,10 @@ RENAME_MAP = {
 
 SLEEP_BETWEEN_REQUESTS = 1.5   # seconds — be polite to MISO's servers
 
+# Only store nodes belonging to Indiana utilities/zones.
+# Filters from ~2,600 MISO-wide nodes down to ~108 Indiana nodes.
+INDIANA_PREFIXES = {"INDIANA", "INDN", "IPL", "NIPS", "SIGE", "PSI_GEN"}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -71,13 +75,17 @@ log = logging.getLogger(__name__)
 
 # ── Download & parse ──────────────────────────────────────────────────────────
 
+CHUNK_SIZE = 50_000   # rows per chunk — keeps peak memory low on 5M-row ZIPs
+
+
 def _fetch_zip_url(url: str) -> pd.DataFrame | None:
-    """Download one weekly ZIP by URL and return its contents as a DataFrame.
+    """Download one weekly ZIP and return only the Indiana rows as a DataFrame.
+    Streams the CSV in chunks so we never hold all 5M rows in memory.
     Returns None if the file doesn't exist (404) or on network error."""
     log.info("Fetching %s", url)
 
     try:
-        resp = requests.get(url, timeout=60)
+        resp = requests.get(url, timeout=120)
     except requests.RequestException as e:
         log.warning("Network error for %s: %s", url, e)
         return None
@@ -92,25 +100,41 @@ def _fetch_zip_url(url: str) -> pd.DataFrame | None:
 
     try:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            # Find the CSV inside (there should be exactly one)
             csv_names = [n for n in zf.namelist() if n.upper().endswith(".CSV")]
             if not csv_names:
                 log.warning("No CSV found inside %s", url)
                 return None
 
-            # MISO CSVs have 4 header rows and 1 footer row
+            kept = []
+            total_rows = 0
             with zf.open(csv_names[0]) as f:
-                df = pd.read_csv(
-                    f,
-                    skiprows=4,
-                    skipfooter=1,
-                    engine="python",
-                )
+                # Read header row manually so we can use chunksize with c engine
+                # MISO CSVs: 4 header rows (rows 0-3 are metadata), row 4 is column names
+                for _ in range(4):
+                    f.readline()
+                reader = pd.read_csv(f, chunksize=CHUNK_SIZE, on_bad_lines="skip")
+                for chunk in reader:
+                    total_rows += len(chunk)
+                    # Drop the footer row MISO appends ("*END*" in first column)
+                    chunk = chunk[~chunk.iloc[:, 0].astype(str).str.startswith("*")]
+                    if "PNODENAME" in chunk.columns:
+                        chunk = chunk[
+                            chunk["PNODENAME"].str.split(".").str[0].isin(INDIANA_PREFIXES)
+                        ]
+                    if not chunk.empty:
+                        kept.append(chunk)
+
     except (zipfile.BadZipFile, Exception) as e:
         log.warning("Could not parse ZIP for %s: %s", url, e)
         return None
 
-    log.info("  → %d raw rows, columns: %s", len(df), list(df.columns))
+    if not kept:
+        log.info("  → %d raw rows scanned, 0 Indiana rows found", total_rows)
+        return pd.DataFrame()
+
+    df = pd.concat(kept, ignore_index=True)
+    log.info("  → %d raw rows scanned, %d Indiana rows retained, columns: %s",
+             total_rows, len(df), list(df.columns))
     return df
 
 
@@ -302,7 +326,14 @@ def main() -> None:
             errors += 1
             continue
 
-        # Optional node filter
+        # Filter to Indiana nodes (always applied)
+        df = df[df["node"].str.split(".").str[0].isin(INDIANA_PREFIXES)]
+        if df.empty:
+            log.info("  → No Indiana nodes in this file, skipping save.")
+            skipped += 1
+            continue
+
+        # Optional additional node filter
         if args.nodes:
             df = df[df["node"].isin(args.nodes)]
             if df.empty:

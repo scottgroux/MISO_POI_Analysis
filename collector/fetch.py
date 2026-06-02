@@ -39,6 +39,10 @@ RENAME_MAP = {
     4: "loss",
 }
 
+# Only store nodes belonging to Indiana utilities/zones.
+# Filters from ~2,600 MISO-wide nodes down to ~108 Indiana nodes.
+INDIANA_PREFIXES = {"INDIANA", "INDN", "IPL", "NIPS", "SIGE", "PSI_GEN"}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -169,6 +173,13 @@ def run(inspect: bool = False) -> None:
     if df.empty:
         log.warning("Nothing to save after cleaning.")
         return
+
+    # Filter to Indiana nodes only
+    df = df[df["node"].str.split(".").str[0].isin(INDIANA_PREFIXES)]
+    if df.empty:
+        log.warning("No Indiana nodes found in this fetch.")
+        return
+    log.info("Indiana filter: %d rows retained", len(df))
 
     # Data can span two calendar dates around midnight — save each separately
     for date_str, group in df.groupby("date"):

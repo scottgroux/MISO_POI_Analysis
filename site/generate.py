@@ -26,13 +26,14 @@ DOCS_DIR.mkdir(exist_ok=True)
 
 PLOTLY_CONFIG = dict(responsive=True)
 
-# Hub nodes that give a good system-wide price signal
+# Indiana hub and aggregation nodes — shown first in the dashboard
 DEFAULT_HUB_NODES = [
-    "MISO.HUBDA",   # MISO Hub Day-Ahead
-    "MISO.HUBRT",   # MISO Hub Real-Time
     "INDIANA.HUB",
-    "ILLINOIS.HUB",
-    "MICHIGAN.HUB",
+    "INDN",
+    "IPL.IPL",
+    "NIPS.NIPS",
+    "SIGE.SIGW",
+    "PSI_GEN.AGG",
 ]
 
 
