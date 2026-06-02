@@ -32,12 +32,11 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "lmp"
 # Columns we care about (MISO field names may vary — adjust if needed after
 # inspecting a live response with fetch.py --inspect)
 RENAME_MAP = {
-    "PNODENAME":  "node",
-    "MKTHOUR_EST": "interval_est",   # e.g. "2025-06-02 14:05:00"
-    "LMP":        "lmp",
-    "CON_LMP":    "congestion",
-    "LOSS_LMP":   "loss",
-    "MLC_LMP":    "mlc",             # marginal loss component (may be absent)
+    0: "interval_est",
+    1: "node",
+    2: "lmp",
+    3: "congestion",
+    4: "loss",
 }
 
 logging.basicConfig(
@@ -112,13 +111,13 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
         df["date"] = df["interval_utc"].dt.date.astype(str)
 
     # Cast price columns to float
-    for col in ["lmp", "congestion", "loss", "mlc"]:
+    for col in ["lmp", "congestion", "loss"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Keep only the columns we've mapped (ignore anything extra)
     keep = [c for c in ["node", "interval_est", "interval_utc", "date",
-                         "lmp", "congestion", "loss", "mlc"]
+                         "lmp", "congestion", "loss"]
             if c in df.columns]
     return df[keep]
 

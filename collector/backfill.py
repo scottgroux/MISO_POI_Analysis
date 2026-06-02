@@ -96,7 +96,7 @@ def fetch_zip(file_date: date) -> pd.DataFrame | None:
     try:
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             # Find the CSV inside (there should be exactly one)
-            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+            csv_names = [n for n in zf.namelist() if n.upper().endswith(".CSV")]
             if not csv_names:
                 log.warning("No CSV found inside %s", url)
                 return None
