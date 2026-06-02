@@ -1,0 +1,183 @@
+"""
+fetch.py
+--------
+Polls the MISO public real-time 5-minute ExPost LMP API and appends
+new intervals to a local Parquet store, partitioned by date.
+
+Run manually:       python collector/fetch.py
+Run on a schedule:  use cron, APScheduler, or Render Cron Job
+"""
+
+import os
+import sys
+import logging
+import requests
+import pandas as pd
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+# MISO rolling market day endpoint (new API, Dec 2025+)
+# Returns all approved 5-min intervals for the current market day.
+ROLLING_URL = (
+    "https://public-api.misoenergy.org/api/MarketPricing"
+    "/GetRealTimeFiveMinExPost/Rolling"
+)
+
+# Where partitioned Parquet files are written.
+# Structure: data/lmp/date=YYYY-MM-DD/part.parquet
+DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "lmp"
+
+# Columns we care about (MISO field names may vary — adjust if needed after
+# inspecting a live response with fetch.py --inspect)
+RENAME_MAP = {
+    "PNODENAME":  "node",
+    "MKTHOUR_EST": "interval_est",   # e.g. "2025-06-02 14:05:00"
+    "LMP":        "lmp",
+    "CON_LMP":    "congestion",
+    "LOSS_LMP":   "loss",
+    "MLC_LMP":    "mlc",             # marginal loss component (may be absent)
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ── Core fetch logic ─────────────────────────────────────────────────────────
+
+def fetch_rolling() -> pd.DataFrame:
+    """Download the current rolling market day from MISO and return a clean DataFrame."""
+    log.info("Fetching rolling LMP data from MISO …")
+    try:
+        resp = requests.get(ROLLING_URL, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Request failed: %s", e)
+        raise
+
+    payload = resp.json()
+
+    # MISO wraps the data in different keys depending on the endpoint version.
+    # Try common wrapper keys; fall back to treating the root as a list.
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "Data", "items", "Items", "result", "Result"):
+            if key in payload:
+                records = payload[key]
+                break
+        else:
+            # If we can't find a list, surface the raw response for inspection.
+            log.warning("Unexpected response shape. Keys: %s", list(payload.keys()))
+            records = []
+    else:
+        records = []
+
+    if not records:
+        log.warning("No records returned. The API response may have changed.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    log.info("Raw response: %d rows, columns: %s", len(df), list(df.columns))
+    return df
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns, parse timestamps, cast numerics."""
+    if df.empty:
+        return df
+
+    # Rename only the columns that exist in this response
+    rename = {k: v for k, v in RENAME_MAP.items() if k in df.columns}
+    df = df.rename(columns=rename)
+
+    # Parse interval timestamp → UTC-aware datetime
+    if "interval_est" in df.columns:
+        df["interval_est"] = pd.to_datetime(df["interval_est"])
+        # MISO reports in Eastern time (EST/EDT). Localise then convert to UTC.
+        try:
+            df["interval_utc"] = (
+                df["interval_est"]
+                .dt.tz_localize("America/New_York", ambiguous="infer")
+                .dt.tz_convert("UTC")
+            )
+        except Exception:
+            df["interval_utc"] = df["interval_est"]
+
+        df["date"] = df["interval_utc"].dt.date.astype(str)
+
+    # Cast price columns to float
+    for col in ["lmp", "congestion", "loss", "mlc"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Keep only the columns we've mapped (ignore anything extra)
+    keep = [c for c in ["node", "interval_est", "interval_utc", "date",
+                         "lmp", "congestion", "loss", "mlc"]
+            if c in df.columns]
+    return df[keep]
+
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+
+def load_existing(date_str: str) -> pd.DataFrame:
+    """Load the Parquet file for a given date if it exists."""
+    path = DATA_DIR / f"date={date_str}" / "part.parquet"
+    if path.exists():
+        return pd.read_parquet(path)
+    return pd.DataFrame()
+
+
+def save(df: pd.DataFrame, date_str: str) -> None:
+    """Append-write (deduplicated) to the Parquet partition for this date."""
+    path = DATA_DIR / f"date={date_str}" / "part.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = load_existing(date_str)
+    combined = pd.concat([existing, df], ignore_index=True)
+
+    # Deduplicate on (node, interval_utc) — the natural primary key
+    dedup_cols = [c for c in ["node", "interval_utc"] if c in combined.columns]
+    if dedup_cols:
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
+        log.info("Dedup: %d → %d rows for %s", before, len(combined), date_str)
+
+    combined.to_parquet(path, index=False, compression="snappy")
+    log.info("Saved %d rows to %s", len(combined), path)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run(inspect: bool = False) -> None:
+    """Main collection cycle: fetch → clean → save."""
+    raw = fetch_rolling()
+
+    if inspect or raw.empty:
+        print("\n── Raw API response (first 3 rows) ──")
+        print(raw.head(3).to_string())
+        print("\n── Columns ──")
+        print(list(raw.columns))
+        if inspect:
+            return
+
+    df = clean(raw)
+    if df.empty:
+        log.warning("Nothing to save after cleaning.")
+        return
+
+    # Data can span two calendar dates around midnight — save each separately
+    for date_str, group in df.groupby("date"):
+        save(group.drop(columns=["date"]), date_str)
+
+    log.info("Collection cycle complete. Total new rows processed: %d", len(df))
+
+
+if __name__ == "__main__":
+    inspect_mode = "--inspect" in sys.argv
+    run(inspect=inspect_mode)
