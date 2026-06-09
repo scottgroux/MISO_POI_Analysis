@@ -95,7 +95,7 @@
 <script>
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 // After enabling R2 public access, paste your pub-XXXX.r2.dev URL here:
-const R2_BASE = "YOUR_R2_PUBLIC_URL_HERE";
+const R2_BASE = "https://pub-455ba07d53da4fdea52b6e06fb93cc36.r2.dev";
 // Example: const R2_BASE = "https://pub-abc123def456.r2.dev";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -297,7 +297,7 @@ function renderActuals(data, node) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 (async () => {
-  if (R2_BASE === "YOUR_R2_PUBLIC_URL_HERE") {
+  if (R2_BASE === "https://pub-455ba07d53da4fdea52b6e06fb93cc36.r2.dev") {
     $("loading").style.display = "none";
     showError("R2 public URL not configured. Edit docs/index.html and set R2_BASE.");
     return;
