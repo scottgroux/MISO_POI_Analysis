@@ -4,7 +4,23 @@ services:
     runtime: python
     schedule: "*/5 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python collector/fetch.py
+    startCommand: python3 collector/fetch.py
+    envVars:
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+
+  - type: cron
+    name: miso-lmp-summarizer
+    runtime: python
+    schedule: "0 7 * * *"   # 2am ET = 7am UTC
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 collector/summarize.py
     envVars:
       - key: R2_ACCOUNT_ID
         sync: false

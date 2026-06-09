@@ -3,80 +3,316 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MISO POI Analysis</title>
+  <title>MISO Indiana LMP Analysis</title>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
-    h1   { font-size: 1.6rem; }
-    .stats { display: flex; gap: 2rem; margin: 1.5rem 0; }
-    .stat { background: #f5f5f5; padding: 1rem 1.5rem; border-radius: 8px; }
-    .stat strong { display: block; font-size: 1.4rem; }
-    ul { column-count: 3; column-gap: 2rem; }
-    a  { color: #1a6fc4; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body   { font-family: system-ui, sans-serif; margin: 0; background: #f7f8fa; color: #1a1a2e; }
+    header { background: #1a1a2e; color: #fff; padding: 1rem 2rem; display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
+    header h1  { margin: 0; font-size: 1.3rem; font-weight: 600; }
+    #meta-strip { display: flex; gap: 1.5rem; font-size: 0.82rem; opacity: 0.75; flex-wrap: wrap; }
+    .meta-item strong { display: block; font-size: 0.95rem; opacity: 1; color: #7dd3fc; }
+
+    .controls { background: #fff; border-bottom: 1px solid #e5e7eb; padding: 0.75rem 2rem; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    label { font-size: 0.85rem; font-weight: 600; color: #555; }
+    select { padding: 0.4rem 0.75rem; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.9rem; background: #fff; cursor: pointer; }
+
+    .tabs { display: flex; gap: 0; border-bottom: 2px solid #e5e7eb; background: #fff; padding: 0 2rem; }
+    .tab  { padding: 0.65rem 1.25rem; cursor: pointer; font-size: 0.88rem; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: color .15s, border-color .15s; }
+    .tab:hover  { color: #1a1a2e; }
+    .tab.active { color: #2563eb; border-color: #2563eb; }
+
+    .panel  { display: none; padding: 1.5rem 2rem; }
+    .panel.active { display: block; }
+
+    .chart-wrap { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.07); padding: 1rem; margin-bottom: 1.5rem; }
+    .chart-desc { font-size: 0.82rem; color: #6b7280; margin: 0.25rem 0 0.75rem; }
+
+    #loading { text-align: center; padding: 4rem; color: #9ca3af; font-size: 1rem; }
+    #error-msg { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 2rem; display: none; }
   </style>
 </head>
 <body>
-  <h1>MISO POI LMP Analysis</h1>
-  <p>Real-time 5-minute Locational Marginal Pricing — updated every 5 minutes.</p>
 
-  <div class="stats">
-    <div class="stat"><strong>22</strong>Days collected</div>
-    <div class="stat"><strong>2026-05-05</strong>Earliest date</div>
-    <div class="stat"><strong>2026-06-02</strong>Latest date</div>
-    <div class="stat"><strong>108</strong>Nodes (latest day)</div>
+<header>
+  <h1>MISO Indiana LMP Analysis</h1>
+  <div id="meta-strip">
+    <div class="meta-item"><strong id="m-dates">—</strong>Days collected</div>
+    <div class="meta-item"><strong id="m-earliest">—</strong>Earliest date</div>
+    <div class="meta-item"><strong id="m-latest">—</strong>Latest date</div>
+    <div class="meta-item"><strong id="m-updated">—</strong>Last updated</div>
   </div>
+</header>
 
-  <h2>Nodes</h2>
-  <ul>
-      <li><a href="node_INDIANA_HUB.html">INDIANA.HUB</a></li>
-      <li><a href="node_INDN.html">INDN</a></li>
-      <li><a href="node_IPL_IPL.html">IPL.IPL</a></li>
-      <li><a href="node_NIPS_NIPS.html">NIPS.NIPS</a></li>
-      <li><a href="node_SIGE_SIGW.html">SIGE.SIGW</a></li>
-      <li><a href="node_PSI_GEN_AGG.html">PSI_GEN.AGG</a></li>
-      <li><a href="node_IPL_16EVCT7.html">IPL.16EVCT7</a></li>
-      <li><a href="node_IPL_16EVCT8.html">IPL.16EVCT8</a></li>
-      <li><a href="node_IPL_16EVST9.html">IPL.16EVST9</a></li>
-      <li><a href="node_IPL_16GEOR11G.html">IPL.16GEOR11G</a></li>
-      <li><a href="node_IPL_16GEOR22G.html">IPL.16GEOR22G</a></li>
-      <li><a href="node_IPL_16GEOR33G.html">IPL.16GEOR33G</a></li>
-      <li><a href="node_IPL_16GEOR44G.html">IPL.16GEOR44G</a></li>
-      <li><a href="node_IPL_16PETE_AGG.html">IPL.16PETE.AGG</a></li>
-      <li><a href="node_IPL_16PETEE3.html">IPL.16PETEE3</a></li>
-      <li><a href="node_IPL_16PETEE4.html">IPL.16PETEE4</a></li>
-      <li><a href="node_IPL_16STOC4C4.html">IPL.16STOC4C4</a></li>
-      <li><a href="node_IPL_16STOC5C5.html">IPL.16STOC5C5</a></li>
-      <li><a href="node_IPL_16STOT_AGG.html">IPL.16STOT.AGG</a></li>
-      <li><a href="node_IPL_16STOU5O5.html">IPL.16STOU5O5</a></li>
-      <li><a href="node_IPL_16STOU6O6.html">IPL.16STOU6O6</a></li>
-      <li><a href="node_IPL_16STOU7O7.html">IPL.16STOU7O7</a></li>
-      <li><a href="node_IPL_16STOUCC6.html">IPL.16STOUCC6</a></li>
-      <li><a href="node_IPL_16STOUTR1.html">IPL.16STOUTR1</a></li>
-      <li><a href="node_IPL_16SYST_AGG.html">IPL.16SYST.AGG</a></li>
-      <li><a href="node_IPL_AZ.html">IPL.AZ</a></li>
-      <li><a href="node_IPL_CC_IPLEV01.html">IPL.CC.IPLEV01</a></li>
-      <li><a href="node_IPL_HE.html">IPL.HE</a></li>
-      <li><a href="node_IPL_HEPM_1_AZ.html">IPL.HEPM_1.AZ</a></li>
-      <li><a href="node_IPL_PEC01.html">IPL.PEC01</a></li>
-      <li><a href="node_IPL_PIKECB01.html">IPL.PIKECB01</a></li>
-      <li><a href="node_IPL_STOU3_ARR.html">IPL.STOU3.ARR</a></li>
-      <li><a href="node_IPL_WVPA.html">IPL.WVPA</a></li>
-      <li><a href="node_NIPS_AM.html">NIPS.AM</a></li>
-      <li><a href="node_NIPS_AZ.html">NIPS.AZ</a></li>
-      <li><a href="node_NIPS_BAILY_ARR.html">NIPS.BAILY.ARR</a></li>
-      <li><a href="node_NIPS_BCWF_SIG.html">NIPS.BCWF.SIG</a></li>
-      <li><a href="node_NIPS_BENTONCO.html">NIPS.BENTONCO</a></li>
-      <li><a href="node_NIPS_BP.html">NIPS.BP</a></li>
-      <li><a href="node_NIPS_BURROAK_H.html">NIPS.BURROAK.H</a></li>
-      <li><a href="node_NIPS_BURROAK_L.html">NIPS.BURROAK.L</a></li>
-      <li><a href="node_NIPS_CARGILL.html">NIPS.CARGILL</a></li>
-      <li><a href="node_NIPS_CARPNTRWF.html">NIPS.CARPNTRWF</a></li>
-      <li><a href="node_NIPS_CAVALRYBS.html">NIPS.CAVALRYBS</a></li>
-      <li><a href="node_NIPS_CAVALRYSF.html">NIPS.CAVALRYSF</a></li>
-      <li><a href="node_NIPS_CC_WHITN.html">NIPS.CC.WHITN</a></li>
-      <li><a href="node_NIPS_DR_PRAXAR.html">NIPS.DR.PRAXAR</a></li>
-      <li><a href="node_NIPS_DUNNBR1SF.html">NIPS.DUNNBR1SF</a></li>
-      <li><a href="node_NIPS_DUNNBR2BS.html">NIPS.DUNNBR2BS</a></li>
-      <li><a href="node_NIPS_DUNNBR2SF.html">NIPS.DUNNBR2SF</a></li>
-  </ul>
+<div class="controls">
+  <label for="node-select">Node</label>
+  <select id="node-select"><option>Loading…</option></select>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="seasonal">Seasonal Profile</div>
+  <div class="tab" data-tab="rolling">7-Day Rolling Avg</div>
+  <div class="tab" data-tab="monthly">Monthly Profile</div>
+  <div class="tab" data-tab="actuals">Recent Actuals</div>
+</div>
+
+<div id="error-msg"></div>
+<div id="loading">Loading data…</div>
+
+<div id="panel-seasonal" class="panel">
+  <div class="chart-wrap">
+    <p class="chart-desc">Average LMP by time-of-day for each month, aggregated across all available years. Reveals intraday price patterns and seasonal shifts.</p>
+    <div id="chart-heatmap" style="height:380px"></div>
+  </div>
+  <div class="chart-wrap">
+    <p class="chart-desc">P10–P90 price band for the selected month, showing typical price volatility range across all years.</p>
+    <div id="chart-band" style="height:300px"></div>
+    <select id="band-month-select" style="margin-top:.5rem"></select>
+  </div>
+</div>
+
+<div id="panel-rolling" class="panel">
+  <div class="chart-wrap">
+    <p class="chart-desc">Raw 5-minute LMP (light) overlaid with the 7-day rolling average (bold). Filters day-to-day noise while preserving weekly trends.</p>
+    <div id="chart-rolling" style="height:380px"></div>
+  </div>
+</div>
+
+<div id="panel-monthly" class="panel">
+  <div class="chart-wrap">
+    <p class="chart-desc">Average LMP by time-of-day for the current calendar month, with P25–P75 interquartile band showing the typical price range.</p>
+    <div id="chart-monthly" style="height:360px"></div>
+  </div>
+</div>
+
+<div id="panel-actuals" class="panel">
+  <div class="chart-wrap">
+    <p class="chart-desc">Last 7 days of raw 5-minute ExPost LMP. Congestion component shown as a dotted line where available.</p>
+    <div id="chart-actuals" style="height:380px"></div>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+// After enabling R2 public access, paste your pub-XXXX.r2.dev URL here:
+const R2_BASE = "YOUR_R2_PUBLIC_URL_HERE";
+// Example: const R2_BASE = "https://pub-abc123def456.r2.dev";
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  return r.json();
+}
+
+function showError(msg) {
+  const el = $("error-msg");
+  el.textContent = msg;
+  el.style.display = "block";
+}
+function hideError() { $("error-msg").style.display = "none"; }
+
+const PLOTLY_CFG = { responsive: true, displayModeBar: false };
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+    tab.classList.add("active");
+    $(`panel-${tab.dataset.tab}`).classList.add("active");
+  });
+});
+
+// ── Meta ──────────────────────────────────────────────────────────────────────
+async function loadMeta() {
+  const meta = await fetchJSON(`${R2_BASE}/summaries/meta.json`);
+  $("m-dates").textContent    = meta.total_dates.toLocaleString();
+  $("m-earliest").textContent = meta.earliest;
+  $("m-latest").textContent   = meta.latest;
+  $("m-updated").textContent  = meta.last_updated.replace("T"," ").replace("Z"," UTC");
+
+  const sel = $("node-select");
+  sel.innerHTML = meta.nodes.map(n => `<option value="${n}">${n}</option>`).join("");
+
+  const bms = $("band-month-select");
+  bms.innerHTML = MONTHS.map(m => `<option value="${m}">${m}</option>`).join("");
+  bms.value = MONTHS[new Date().getMonth()];
+  bms.addEventListener("change", () => renderBand(window._seasonal, bms.value));
+
+  return meta;
+}
+
+// ── Node data loading ─────────────────────────────────────────────────────────
+async function loadNode(node) {
+  hideError();
+  $("loading").style.display = "block";
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+
+  try {
+    const base = `${R2_BASE}/summaries/${node}`;
+    const [seasonal, rolling, monthly, actuals] = await Promise.all([
+      fetchJSON(`${base}/seasonal.json`),
+      fetchJSON(`${base}/rolling_7d.json`),
+      fetchJSON(`${base}/monthly_avg.json`),
+      fetchJSON(`${base}/recent_actuals.json`),
+    ]);
+
+    window._seasonal = seasonal;
+
+    renderHeatmap(seasonal, node);
+    renderBand(seasonal, $("band-month-select").value);
+    renderRolling(rolling, node);
+    renderMonthly(monthly, node);
+    renderActuals(actuals, node);
+
+    $("loading").style.display = "none";
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+    document.querySelector('[data-tab="seasonal"]').classList.add("active");
+    $("panel-seasonal").classList.add("active");
+
+  } catch(e) {
+    $("loading").style.display = "none";
+    showError(`Failed to load data for ${node}: ${e.message}`);
+  }
+}
+
+// ── Chart renderers ───────────────────────────────────────────────────────────
+
+function renderHeatmap(data, node) {
+  const z     = MONTHS.map(m => data.months[m]?.avg ?? []);
+  const slots = data.slots;
+
+  Plotly.react("chart-heatmap", [{
+    type: "heatmap",
+    z, x: slots, y: MONTHS,
+    colorscale: "RdYlGn_r",
+    colorbar: { title: "$/MWh", thickness: 14 },
+    hovertemplate: "%{y} %{x}<br>Avg LMP: $%{z:.2f}/MWh<extra></extra>",
+  }], {
+    title: { text: `Seasonal LMP Heatmap — ${node}`, font: { size: 14 } },
+    xaxis: { title: "Time of Day (UTC)", tickangle: -45, nticks: 24 },
+    margin: { l: 60, r: 20, t: 50, b: 80 },
+  }, PLOTLY_CFG);
+}
+
+function renderBand(data, month) {
+  const slots = data.slots;
+  const m     = data.months[month] ?? {};
+  const avg   = m.avg ?? [];
+  const p10   = m.p10 ?? [];
+  const p90   = m.p90 ?? [];
+
+  Plotly.react("chart-band", [
+    { x: slots, y: p90, mode:"lines", line:{width:0}, name:"P90", showlegend:false },
+    {
+      x: [...slots, ...slots.slice().reverse()],
+      y: [...p90, ...p10.slice().reverse()],
+      fill:"toself", fillcolor:"rgba(37,99,235,0.12)", line:{width:0},
+      name:"P10–P90", hoverinfo:"skip",
+    },
+    { x: slots, y: avg, mode:"lines", line:{color:"#2563eb",width:2}, name:"Avg LMP" },
+    { x: slots, y: p10, mode:"lines", line:{width:0}, name:"P10", showlegend:false },
+  ], {
+    title: { text: `${month} Price Band (P10–P90)`, font: { size: 14 } },
+    xaxis: { title: "Time of Day (UTC)", nticks: 24 },
+    yaxis: { title: "$/MWh" },
+    legend: { orientation:"h", y:-0.2 },
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    hovermode: "x unified",
+  }, PLOTLY_CFG);
+}
+
+function renderRolling(data, node) {
+  Plotly.react("chart-rolling", [
+    {
+      x: data.timestamps, y: data.lmp,
+      mode:"lines", name:"5-min LMP",
+      line:{color:"#93c5fd", width:1}, opacity:0.7,
+    },
+    {
+      x: data.timestamps, y: data.rolling_7d,
+      mode:"lines", name:"7-day rolling avg",
+      line:{color:"#1d4ed8", width:2.5},
+    },
+  ], {
+    title: { text: `7-Day Rolling Average — ${node}`, font: { size: 14 } },
+    xaxis: { title: "Date (UTC)" },
+    yaxis: { title: "$/MWh" },
+    legend: { orientation:"h", y:-0.2 },
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    hovermode: "x unified",
+  }, PLOTLY_CFG);
+}
+
+function renderMonthly(data, node) {
+  const slots = data.slots;
+  Plotly.react("chart-monthly", [
+    { x: slots, y: data.p75, mode:"lines", line:{width:0}, name:"P75", showlegend:false },
+    {
+      x: [...slots, ...slots.slice().reverse()],
+      y: [...data.p75, ...data.p25.slice().reverse()],
+      fill:"toself", fillcolor:"rgba(16,185,129,0.15)", line:{width:0},
+      name:"P25–P75", hoverinfo:"skip",
+    },
+    { x: slots, y: data.avg, mode:"lines", line:{color:"#059669",width:2.5}, name:"Avg LMP" },
+    { x: slots, y: data.p25, mode:"lines", line:{width:0}, name:"P25", showlegend:false },
+  ], {
+    title: { text: `Monthly Average (${data.month}) — ${node}`, font: { size: 14 } },
+    xaxis: { title: "Time of Day (UTC)", nticks: 24 },
+    yaxis: { title: "$/MWh" },
+    legend: { orientation:"h", y:-0.2 },
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    hovermode: "x unified",
+  }, PLOTLY_CFG);
+}
+
+function renderActuals(data, node) {
+  const traces = [{
+    x: data.timestamps, y: data.lmp,
+    mode:"lines", name:"LMP",
+    line:{color:"#1f77b4", width:1.5},
+  }];
+  if (data.congestion) {
+    traces.push({
+      x: data.timestamps, y: data.congestion,
+      mode:"lines", name:"Congestion",
+      line:{color:"#ff7f0e", width:1, dash:"dot"},
+    });
+  }
+
+  Plotly.react("chart-actuals", traces, {
+    title: { text: `Recent Actuals (last 7 days) — ${node}`, font: { size: 14 } },
+    xaxis: { title: "Interval (UTC)" },
+    yaxis: { title: "$/MWh" },
+    legend: { orientation:"h", y:-0.2 },
+    margin: { l: 60, r: 20, t: 50, b: 60 },
+    hovermode: "x unified",
+  }, PLOTLY_CFG);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+(async () => {
+  if (R2_BASE === "YOUR_R2_PUBLIC_URL_HERE") {
+    $("loading").style.display = "none";
+    showError("R2 public URL not configured. Edit docs/index.html and set R2_BASE.");
+    return;
+  }
+
+  try {
+    await loadMeta();
+    const sel = $("node-select");
+    await loadNode(sel.value);
+    sel.addEventListener("change", () => loadNode(sel.value));
+  } catch(e) {
+    $("loading").style.display = "none";
+    showError(`Could not load metadata from R2: ${e.message}`);
+  }
+})();
+</script>
 </body>
 </html>

@@ -104,6 +104,24 @@ def list_dates() -> list[str]:
     return sorted(dates)
 
 
+def upload_json(data, key: str) -> None:
+    """Upload a JSON-serializable object to R2 at the given key.
+    Key should not have a leading slash, e.g. 'summaries/meta.json'."""
+    import json
+    body = json.dumps(data, separators=(",", ":")).encode()
+    try:
+        _client().put_object(
+            Bucket=_bucket(),
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+        )
+        log.info("R2 JSON upload OK: %s (%d bytes)", key, len(body))
+    except ClientError as e:
+        log.error("R2 JSON upload failed for %s: %s", key, e)
+        raise
+
+
 def r2_enabled() -> bool:
     """Return True if all required R2 env vars are set."""
     has_bucket = "R2_BUCKET" in os.environ or "R2_BUCKET_NAME" in os.environ

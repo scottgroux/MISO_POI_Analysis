@@ -1,58 +1,40 @@
-# .github/workflows/update.yml
+# update.yml
 #
-# Runs every 5 minutes:
-#   1. Fetches latest MISO LMP data
-#   2. Regenerates static site charts
-#   3. Commits data + pushes updated docs/ to GitHub Pages
+# Deploys docs/ to GitHub Pages whenever changes are pushed to main.
+# Data collection and summarization are handled by Render cron jobs.
 #
-# Prerequisites:
-#   - GitHub Pages enabled on the repo, source set to "docs/" on main branch
-#   - A Personal Access Token (PAT) with repo write scope stored as
-#     secret GH_PAT (Settings → Secrets → Actions → New repository secret)
+# Manual trigger available via Actions tab → "Run workflow".
 
-name: Collect & Deploy
+name: Deploy Site
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub's minimum)
-  workflow_dispatch:          # allow manual trigger from Actions tab
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  collect-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 4        # must finish before next 5-min trigger
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          token: ${{ secrets.GH_PAT }}
-          fetch-depth: 1
+          path: docs/
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Collect latest LMP data
-        run: python collector/fetch.py
-
-      - name: Generate static charts
-        run: python site/generate.py
-        # This script reads from data/lmp/ and writes HTML to docs/
-
-      - name: Commit & push
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/ docs/
-          # Only commit if there are actual changes
-          git diff --cached --quiet || git commit -m "chore: auto-update $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
