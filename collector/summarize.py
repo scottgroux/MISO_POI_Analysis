@@ -178,6 +178,63 @@ def _round_list(series: pd.Series, decimals: int = 2) -> list:
     return [round(float(v), decimals) if pd.notna(v) else None for v in series]
 
 
+# ── Streaming seasonal aggregation ───────────────────────────────────────────
+
+def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
+    """Compute seasonal avg/P10/P90 per node by streaming one partition at a time.
+    Accumulates (node, month, slot) → list of lmp values without loading all
+    data into memory simultaneously."""
+    from collections import defaultdict
+
+    # acc[node][month][slot] = [lmp, ...]
+    acc: dict[str, dict[int, dict[int, list]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+
+    log.info("Streaming %d partitions for seasonal aggregation…", len(all_dates))
+    for i, date_str in enumerate(all_dates, 1):
+        df = load_date(date_str)
+        if df.empty:
+            continue
+
+        df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce").astype("float32")
+        df = df.dropna(subset=["lmp"])
+
+        dt = pd.to_datetime(df["interval_utc"], utc=True)
+        df = df.copy()
+        df["month"] = dt.dt.month.astype("int8")
+        df["slot"]  = ((dt.dt.hour * 60 + dt.dt.minute) // 5).astype("int16")
+
+        for (node_val, month_val, slot_val), grp in df.groupby(["node","month","slot"])["lmp"]:
+            acc[node_val][int(month_val)][int(slot_val)].extend(grp.tolist())
+
+        if i % 100 == 0:
+            log.info("  Streamed %d / %d partitions", i, len(all_dates))
+
+    log.info("Seasonal accumulation done. Computing stats…")
+
+    # Convert to per-node seasonal dicts
+    results: dict[str, dict] = {}
+    for node, months_data in acc.items():
+        month_out = {}
+        for month_num in range(1, 13):
+            slot_data = months_data.get(month_num, {})
+            avg_l, p10_l, p90_l = [], [], []
+            for slot_idx in range(288):
+                vals = slot_data.get(slot_idx, [])
+                if vals:
+                    arr = np.array(vals, dtype="float32")
+                    avg_l.append(round(float(arr.mean()), 2))
+                    p10_l.append(round(float(np.percentile(arr, 10)), 2))
+                    p90_l.append(round(float(np.percentile(arr, 90)), 2))
+                else:
+                    avg_l.append(None); p10_l.append(None); p90_l.append(None)
+            month_out[MONTH_ABBR[month_num - 1]] = {"avg": avg_l, "p10": p10_l, "p90": p90_l}
+        results[node] = {"slots": SLOT_LABELS, "months": month_out}
+
+    return results
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -191,37 +248,33 @@ def main() -> None:
     log.info("Store: %d total dates, using last %d for recent summaries",
              len(all_dates), len(recent_dates))
 
-    # ── Load all data for seasonal computation ────────────────────────────────
-    log.info("Loading ALL partitions for seasonal summaries…")
-    all_df = load_all(all_dates)
-    if all_df.empty:
-        log.error("No data loaded — aborting.")
-        sys.exit(1)
+    # ── Discover nodes from a sample ─────────────────────────────────────────
+    sample = load_date(all_dates[-1])
+    nodes = sorted(sample["node"].unique().tolist()) if not sample.empty else []
+    log.info("Nodes: %d", len(nodes))
 
-    # Use float32 to cut memory roughly in half
-    all_df["lmp"] = all_df["lmp"].astype("float32")
-    nodes = sorted(all_df["node"].unique().tolist())
-    log.info("Nodes found: %d", len(nodes))
+    # ── Seasonal: stream all partitions, accumulate per (node,month,slot) ────
+    seasonal_by_node = compute_seasonal_streaming(all_dates)
 
-    # ── Load recent data for rolling/monthly/actuals ──────────────────────────
+    # ── Recent: load last 35 days (small, fits easily in memory) ─────────────
     log.info("Loading last %d partitions for recent summaries…", len(recent_dates))
     recent_df = load_all(recent_dates)
     if "lmp" in recent_df.columns:
         recent_df["lmp"] = recent_df["lmp"].astype("float32")
 
-    # ── Per-node summaries ────────────────────────────────────────────────────
+    # ── Per-node upload ───────────────────────────────────────────────────────
     for i, node in enumerate(nodes, 1):
-        log.info("[%d/%d] Summarizing %s", i, len(nodes), node)
-        node_all    = all_df[all_df["node"] == node]
-        node_recent = recent_df[recent_df["node"] == node] if not recent_df.empty else pd.DataFrame()
-
+        log.info("[%d/%d] Uploading %s", i, len(nodes), node)
         prefix = f"summaries/{node}"
 
-        upload_json(compute_seasonal(node_all),        f"{prefix}/seasonal.json")
+        if node in seasonal_by_node:
+            upload_json(seasonal_by_node[node], f"{prefix}/seasonal.json")
+
+        node_recent = recent_df[recent_df["node"] == node] if not recent_df.empty else pd.DataFrame()
         if not node_recent.empty:
-            upload_json(compute_rolling_7d(node_recent),   f"{prefix}/rolling_7d.json")
-            upload_json(compute_monthly_avg(node_recent),  f"{prefix}/monthly_avg.json")
-            upload_json(compute_recent_actuals(node_recent), f"{prefix}/recent_actuals.json")
+            upload_json(compute_rolling_7d(node_recent),      f"{prefix}/rolling_7d.json")
+            upload_json(compute_monthly_avg(node_recent),     f"{prefix}/monthly_avg.json")
+            upload_json(compute_recent_actuals(node_recent),  f"{prefix}/recent_actuals.json")
 
     # ── Global meta ───────────────────────────────────────────────────────────
     meta = {
