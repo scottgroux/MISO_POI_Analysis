@@ -4,21 +4,65 @@ store.py
 Shared helpers for reading from the Parquet data store.
 Used by both analysis scripts and the site generator.
 
-The store is a Hive-partitioned directory:
+Storage layout (local and R2 mirror the same structure):
   data/lmp/date=YYYY-MM-DD/part.parquet
+
+Read path (when R2 env vars are set):
+  1. Check local cache  → return immediately if present
+  2. Download from R2   → cache locally → return
+  3. If neither exists  → return empty DataFrame
+
+When R2 env vars are absent, reads from local cache only.
 """
 
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 
+log = logging.getLogger(__name__)
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "lmp"
 
 
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _local_path(date_str: str) -> Path:
+    return DATA_DIR / f"date={date_str}" / "part.parquet"
+
+
+def _try_r2_download(date_str: str, path: Path) -> bool:
+    """Attempt to pull a partition from R2 into the local cache.
+    Returns True if successful, False if R2 is disabled or the object is absent."""
+    try:
+        from r2 import download, r2_enabled
+    except ImportError:
+        return False
+    if not r2_enabled():
+        return False
+    return download(date_str, path)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def available_dates() -> list[str]:
-    """Return a sorted list of all date partitions present in the store."""
+    """Return a sorted list of all date partitions.
+
+    Sources (in priority order):
+      1. R2 listing (authoritative when env vars are set)
+      2. Local cache listing (fallback / offline mode)
+    """
+    try:
+        from r2 import list_dates, r2_enabled
+        if r2_enabled():
+            dates = list_dates()
+            if dates:
+                return dates
+    except ImportError:
+        pass
+
     return sorted(
         p.name.replace("date=", "")
         for p in DATA_DIR.glob("date=*")
@@ -27,11 +71,19 @@ def available_dates() -> list[str]:
 
 
 def load_date(date_str: str) -> pd.DataFrame:
-    """Load a single date partition. Returns empty DataFrame if not found."""
-    path = DATA_DIR / f"date={date_str}" / "part.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+    """Load a single date partition.
+
+    Checks local cache first; if absent, attempts R2 download.
+    Returns empty DataFrame if data is not found anywhere.
+    """
+    path = _local_path(date_str)
+    if path.exists():
+        return pd.read_parquet(path)
+
+    if _try_r2_download(date_str, path):
+        return pd.read_parquet(path)
+
+    return pd.DataFrame()
 
 
 def load_range(

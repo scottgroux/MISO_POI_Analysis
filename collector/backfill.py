@@ -36,6 +36,12 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 BASE_URL = "https://docs.misoenergy.org/marketreports/{date}_5MIN_LMP.zip"
@@ -151,19 +157,15 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
         log.warning("Expected column 'MKTHOUR_EST' not found. Columns: %s", list(df.columns))
         return pd.DataFrame()
 
-    # Parse timestamp and convert to UTC
+    # Parse timestamp and convert to UTC.
+    # MISO's MKTHOUR_EST is a fixed UTC-5 offset year-round (no DST observed —
+    # verified empirically: no gap on spring-forward days, no duplicated hour
+    # on fall-back days). A plain +5h shift is correct and never ambiguous,
+    # unlike tz_localize("America/New_York") which misconverts ~half the year.
     df["interval_est"] = pd.to_datetime(df["interval_est"], errors="coerce")
     df = df.dropna(subset=["interval_est"])
 
-    try:
-        df["interval_utc"] = (
-            df["interval_est"]
-            .dt.tz_localize("America/New_York", ambiguous="infer")
-            .dt.tz_convert("UTC")
-        )
-    except Exception as e:
-        log.warning("Timezone conversion failed: %s", e)
-        df["interval_utc"] = df["interval_est"]
+    df["interval_utc"] = (df["interval_est"] + pd.Timedelta(hours=5)).dt.tz_localize("UTC")
 
     df["date"] = df["interval_utc"].dt.date.astype(str)
 
@@ -193,6 +195,14 @@ def save_partition(df: pd.DataFrame, date_str: str) -> None:
         df = df.drop_duplicates(subset=dedup_cols, keep="last")
 
     df.to_parquet(path, index=False, compression="snappy")
+
+    # Write-through to R2 (no-op if env vars not set)
+    try:
+        from r2 import upload, r2_enabled
+        if r2_enabled():
+            upload(path, date_str)
+    except Exception as e:
+        log.warning("R2 upload skipped for %s: %s", date_str, e)
 
 
 def save_weekly_data(df: pd.DataFrame) -> None:

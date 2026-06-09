@@ -16,6 +16,12 @@ import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv optional; env vars can be set by other means
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 # MISO rolling market day endpoint (new API, Dec 2025+)
@@ -99,18 +105,14 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     rename = {k: v for k, v in RENAME_MAP.items() if k in df.columns}
     df = df.rename(columns=rename)
 
-    # Parse interval timestamp → UTC-aware datetime
+    # Parse interval timestamp → UTC-aware datetime.
+    # MISO's timestamp is a fixed UTC-5 offset year-round (no DST observed —
+    # verified empirically: no gap on spring-forward days, no duplicated hour
+    # on fall-back days). A plain +5h shift is correct and never ambiguous,
+    # unlike tz_localize("America/New_York") which misconverts ~half the year.
     if "interval_est" in df.columns:
         df["interval_est"] = pd.to_datetime(df["interval_est"])
-        # MISO reports in Eastern time (EST/EDT). Localise then convert to UTC.
-        try:
-            df["interval_utc"] = (
-                df["interval_est"]
-                .dt.tz_localize("America/New_York", ambiguous="infer")
-                .dt.tz_convert("UTC")
-            )
-        except Exception:
-            df["interval_utc"] = df["interval_est"]
+        df["interval_utc"] = (df["interval_est"] + pd.Timedelta(hours=5)).dt.tz_localize("UTC")
 
         df["date"] = df["interval_utc"].dt.date.astype(str)
 
@@ -129,10 +131,20 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
 # ── Storage ──────────────────────────────────────────────────────────────────
 
 def load_existing(date_str: str) -> pd.DataFrame:
-    """Load the Parquet file for a given date if it exists."""
+    """Load the Parquet file for a given date.
+    Checks local cache first; falls back to R2 download if absent (needed on
+    ephemeral runtimes like Render where there is no persistent local cache)."""
     path = DATA_DIR / f"date={date_str}" / "part.parquet"
     if path.exists():
         return pd.read_parquet(path)
+    try:
+        from r2 import download, r2_enabled
+        if r2_enabled():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if download(date_str, path):
+                return pd.read_parquet(path)
+    except Exception as e:
+        log.warning("R2 prefetch failed for %s: %s", date_str, e)
     return pd.DataFrame()
 
 
@@ -153,6 +165,14 @@ def save(df: pd.DataFrame, date_str: str) -> None:
 
     combined.to_parquet(path, index=False, compression="snappy")
     log.info("Saved %d rows to %s", len(combined), path)
+
+    # Write-through to R2 (no-op if env vars not set)
+    try:
+        from r2 import upload, r2_enabled
+        if r2_enabled():
+            upload(path, date_str)
+    except Exception as e:
+        log.warning("R2 upload skipped: %s", e)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -6,6 +6,10 @@ requests>=2.31.0
 pandas>=2.1.0
 pyarrow>=14.0.0       # Parquet read/write backend
 
+# Cloudflare R2 (S3-compatible object storage)
+boto3>=1.34.0
+python-dotenv>=1.0.0  # loads .env in local dev
+
 # Scheduling (local dev only — Render Cron handles this in production)
 schedule>=1.2.0
 
@@ -14,9 +18,3 @@ numpy>=1.26.0
 
 # Chart generation → static HTML for GitHub Pages
 plotly>=5.18.0
-
-# Optional: faster Parquet alternative to pyarrow
-# fastparquet>=2023.10.1
-
-# Optional: timezone handling (pandas uses this under the hood)
-# pytz>=2023.3
