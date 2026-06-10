@@ -13,6 +13,8 @@ Summary types (per node, all 109 Indiana nodes):
 
 Global:
   summaries/meta.json — node list, date range, last_updated timestamp
+  summaries/geo_seasonal.json — avg LMP by (month × 5-min slot) for every node,
+    used by the Geo-View map
 
 Scheduled to run nightly ~2am via Render cron job.
 """
@@ -42,7 +44,6 @@ SLOT_LABELS = [f"{h:02d}:{m:02d}" for h in range(24) for m in range(0, 60, 5)]
 MONTH_ABBR  = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 RECENT_DAYS   = 35   # days to load for rolling/monthly/actuals
-ROLLING_WINDOW = 7 * 288  # 7 days × 288 intervals = 2016 intervals
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -120,10 +121,10 @@ def compute_rolling_7d(df: pd.DataFrame) -> dict:
     df["interval_utc"] = pd.to_datetime(df["interval_utc"], utc=True)
     df = df.sort_values("interval_utc")
 
-    # Rolling mean over a sorted time series
+    # Time-based rolling window: "trailing 7 days" by timestamp, not row count.
+    # This stays correct even when there are gaps in the 5-minute series.
     df["rolling_7d"] = (
-        df["lmp"]
-        .rolling(window=ROLLING_WINDOW, min_periods=1)
+        df.rolling("7D", on="interval_utc", min_periods=1)["lmp"]
         .mean()
     )
 
@@ -176,6 +177,16 @@ def compute_recent_actuals(df: pd.DataFrame) -> dict:
 
 def _round_list(series: pd.Series, decimals: int = 2) -> list:
     return [round(float(v), decimals) if pd.notna(v) else None for v in series]
+
+
+def compute_geo_seasonal(seasonal_by_node: dict[str, dict]) -> dict:
+    """Combine per-node seasonal averages into a single payload for the
+    Geo-View map: avg LMP by (month x slot) for every node, keyed by node."""
+    nodes = {
+        node: {m: data["months"][m]["avg"] for m in MONTH_ABBR}
+        for node, data in seasonal_by_node.items()
+    }
+    return {"slots": SLOT_LABELS, "nodes": nodes}
 
 
 # ── Streaming seasonal aggregation ───────────────────────────────────────────
@@ -255,6 +266,9 @@ def main() -> None:
 
     # ── Seasonal: stream all partitions, accumulate per (node,month,slot) ────
     seasonal_by_node = compute_seasonal_streaming(all_dates)
+
+    # ── Geo-View: combine per-node seasonal averages into one payload ────────
+    upload_json(compute_geo_seasonal(seasonal_by_node), "summaries/geo_seasonal.json")
 
     # ── Recent: load last 35 days (small, fits easily in memory) ─────────────
     log.info("Loading last %d partitions for recent summaries…", len(recent_dates))

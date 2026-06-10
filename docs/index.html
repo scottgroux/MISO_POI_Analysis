@@ -28,6 +28,11 @@
     .chart-wrap { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.07); padding: 1rem; margin-bottom: 1.5rem; }
     .chart-desc { font-size: 0.82rem; color: #6b7280; margin: 0.25rem 0 0.75rem; }
 
+    .geo-controls { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .geo-controls label { white-space: nowrap; }
+    .geo-controls strong { color: #1a1a2e; }
+    #geo-time-slider { flex: 1; min-width: 200px; accent-color: #2563eb; }
+
     #loading { text-align: center; padding: 4rem; color: #9ca3af; font-size: 1rem; }
     #error-msg { background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5; border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 2rem; display: none; }
   </style>
@@ -50,7 +55,8 @@
 </div>
 
 <div class="tabs">
-  <div class="tab active" data-tab="seasonal">Seasonal Profile</div>
+  <div class="tab active" data-tab="geo">Geo-View</div>
+  <div class="tab" data-tab="seasonal">Seasonal Profile</div>
   <div class="tab" data-tab="rolling">7-Day Rolling Avg</div>
   <div class="tab" data-tab="monthly">Monthly Profile</div>
   <div class="tab" data-tab="actuals">Recent Actuals</div>
@@ -58,6 +64,19 @@
 
 <div id="error-msg"></div>
 <div id="loading">Loading data…</div>
+
+<div id="panel-geo" class="panel active">
+  <div class="chart-wrap">
+    <p class="chart-desc">Average LMP across all Indiana nodes at the chosen month and time of day, averaged over all available years. The node selected above is highlighted with a dark outline.</p>
+    <div class="geo-controls">
+      <label for="geo-month-select">Month</label>
+      <select id="geo-month-select"></select>
+      <label for="geo-time-slider">Time of day (UTC): <strong id="geo-time-label">—</strong></label>
+      <input type="range" id="geo-time-slider" min="0" max="287" step="1">
+    </div>
+    <div id="chart-geo" style="height:520px"></div>
+  </div>
+</div>
 
 <div id="panel-seasonal" class="panel">
   <div class="chart-wrap">
@@ -116,6 +135,10 @@ function hideError() { $("error-msg").style.display = "none"; }
 
 const PLOTLY_CFG = { responsive: true, displayModeBar: false };
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const SLOT_LABELS = Array.from({ length: 288 }, (_, i) => {
+  const h = Math.floor(i / 12), m = (i % 12) * 5;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+});
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 document.querySelectorAll(".tab").forEach(tab => {
@@ -124,6 +147,7 @@ document.querySelectorAll(".tab").forEach(tab => {
     document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
     tab.classList.add("active");
     $(`panel-${tab.dataset.tab}`).classList.add("active");
+    if (tab.dataset.tab === "geo") ensureGeoLoaded();
   });
 });
 
@@ -168,12 +192,13 @@ async function loadNode(node) {
     renderRolling(rolling, node);
     renderMonthly(monthly, node);
     renderActuals(actuals, node);
+    if (window._geoLoaded) renderGeoView();
 
     $("loading").style.display = "none";
-    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
-    document.querySelector('[data-tab="seasonal"]').classList.add("active");
-    $("panel-seasonal").classList.add("active");
+    const activeTab = document.querySelector(".tab.active") || document.querySelector('[data-tab="geo"]');
+    activeTab.classList.add("active");
+    $(`panel-${activeTab.dataset.tab}`).classList.add("active");
 
   } catch(e) {
     $("loading").style.display = "none";
@@ -196,6 +221,7 @@ function renderHeatmap(data, node) {
   }], {
     title: { text: `Seasonal LMP Heatmap — ${node}`, font: { size: 14 } },
     xaxis: { title: "Time of Day (UTC)", tickangle: -45, nticks: 24 },
+    yaxis: { title: "Month", autorange: "reversed" },
     margin: { l: 60, r: 20, t: 50, b: 80 },
   }, PLOTLY_CFG);
 }
@@ -295,6 +321,115 @@ function renderActuals(data, node) {
   }, PLOTLY_CFG);
 }
 
+// ── Geo-View ──────────────────────────────────────────────────────────────────
+
+async function ensureGeoLoaded() {
+  if (window._geoLoaded) return;
+  window._geoLoaded = true;
+  try {
+    const [coords, geo] = await Promise.all([
+      fetchJSON("data/node_coords.json"),
+      fetchJSON(`${R2_BASE}/summaries/geo_seasonal.json`),
+    ]);
+    window._nodeCoords = coords;
+    window._geoSeasonal = geo;
+    initGeoControls();
+    renderGeoView();
+  } catch (e) {
+    window._geoLoaded = false;
+    showError(`Failed to load Geo-View data: ${e.message}`);
+  }
+}
+
+function initGeoControls() {
+  const ms = $("geo-month-select");
+  ms.innerHTML = MONTHS.map(m => `<option value="${m}">${m}</option>`).join("");
+  ms.value = MONTHS[new Date().getUTCMonth()];
+  ms.addEventListener("change", renderGeoView);
+
+  const slider = $("geo-time-slider");
+  const now = new Date();
+  slider.value = Math.floor((now.getUTCHours() * 60 + now.getUTCMinutes()) / 5);
+  updateGeoTimeLabel();
+  slider.addEventListener("input", () => {
+    updateGeoTimeLabel();
+    renderGeoView();
+  });
+}
+
+function updateGeoTimeLabel() {
+  $("geo-time-label").textContent = `${SLOT_LABELS[+$("geo-time-slider").value]} UTC`;
+}
+
+function renderGeoView() {
+  const geo = window._geoSeasonal;
+  const coords = window._nodeCoords;
+  if (!geo || !coords) return;
+
+  const month     = $("geo-month-select").value;
+  const slot      = +$("geo-time-slider").value;
+  const highlight = $("node-select").value;
+
+  const lats = [], lons = [], vals = [], texts = [];
+  let hLat, hLon, hVal, hText;
+
+  for (const [node, months] of Object.entries(geo.nodes)) {
+    const c = coords[node];
+    if (!c) continue;
+    const v = months[month] ? months[month][slot] : null;
+    if (v == null) continue;
+
+    if (node === highlight) {
+      hLat = c.lat; hLon = c.lon; hVal = v;
+      hText = `${c.label}<br>${node}`;
+    } else {
+      lats.push(c.lat); lons.push(c.lon); vals.push(v);
+      texts.push(`${c.label}<br>${node}`);
+    }
+  }
+
+  const allVals = hVal != null ? vals.concat(hVal) : vals;
+  if (allVals.length === 0) {
+    showError(`No Geo-View data for ${month} @ ${SLOT_LABELS[slot]} UTC`);
+    return;
+  }
+  const cmin = Math.min(...allVals);
+  const cmax = Math.max(...allVals);
+
+  const traces = [{
+    type: "scattermapbox",
+    lat: lats, lon: lons,
+    mode: "markers",
+    marker: {
+      size: 11, color: vals, colorscale: "RdYlGn_r", cmin, cmax,
+      colorbar: { title: "$/MWh", thickness: 14 },
+    },
+    text: texts,
+    hovertemplate: "%{text}<br>$%{marker.color:.2f}/MWh<extra></extra>",
+  }];
+
+  if (hLat != null) {
+    traces.push({
+      type: "scattermapbox",
+      lat: [hLat], lon: [hLon],
+      mode: "markers",
+      marker: {
+        size: 22, color: [hVal], colorscale: "RdYlGn_r", cmin, cmax,
+        showscale: false, line: { width: 2, color: "#1a1a2e" },
+      },
+      text: [hText],
+      hovertemplate: "%{text}<br>$%{marker.color:.2f}/MWh (selected)<extra></extra>",
+    });
+  }
+
+  Plotly.react("chart-geo", traces, {
+    title: { text: `Avg LMP — ${month} @ ${SLOT_LABELS[slot]} UTC (all years)`, font: { size: 14 } },
+    mapbox: { style: "carto-positron", center: { lat: 39.9, lon: -86.4 }, zoom: 6.2 },
+    margin: { l: 0, r: 0, t: 40, b: 0 },
+    showlegend: false,
+  }, PLOTLY_CFG);
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 (async () => {
   if (R2_BASE === "YOUR_R2_PUBLIC_URL_HERE") {
@@ -308,6 +443,9 @@ function renderActuals(data, node) {
     const sel = $("node-select");
     await loadNode(sel.value);
     sel.addEventListener("change", () => loadNode(sel.value));
+    if (document.querySelector('[data-tab="geo"]').classList.contains("active")) {
+      ensureGeoLoaded();
+    }
   } catch(e) {
     $("loading").style.display = "none";
     showError(`Could not load metadata from R2: ${e.message}`);

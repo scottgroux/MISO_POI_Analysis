@@ -122,6 +122,19 @@ def upload_json(data, key: str) -> None:
         raise
 
 
+def download_json(key: str):
+    """Download and parse a JSON object from R2. Returns None if the key does not exist."""
+    import json
+    try:
+        resp = _client().get_object(Bucket=_bucket(), Key=key)
+        return json.loads(resp["Body"].read())
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return None
+        log.error("R2 JSON download failed for %s: %s", key, e)
+        raise
+
+
 def r2_enabled() -> bool:
     """Return True if all required R2 env vars are set."""
     has_bucket = "R2_BUCKET" in os.environ or "R2_BUCKET_NAME" in os.environ
