@@ -21,6 +21,7 @@ Scheduled to run nightly ~2am via Render cron job.
 
 import logging
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -193,14 +194,15 @@ def compute_geo_seasonal(seasonal_by_node: dict[str, dict]) -> dict:
 
 def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
     """Compute seasonal avg/P10/P90 per node by streaming one partition at a time.
-    Accumulates (node, month, slot) → list of lmp values without loading all
-    data into memory simultaneously."""
+
+    For each (node, month), accumulates one 288-slot row per day (a small
+    float32 array) rather than every raw reading individually — this keeps
+    memory roughly proportional to (nodes x months x days), not total rows,
+    which matters once the store spans years of 5-minute data."""
     from collections import defaultdict
 
-    # acc[node][month][slot] = [lmp, ...]
-    acc: dict[str, dict[int, dict[int, list]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
+    # acc[node][month] = [row, ...] where each row is a 288-slot float32 array
+    acc: dict[str, dict[int, list]] = defaultdict(lambda: defaultdict(list))
 
     log.info("Streaming %d partitions for seasonal aggregation…", len(all_dates))
     for i, date_str in enumerate(all_dates, 1):
@@ -208,16 +210,18 @@ def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
         if df.empty:
             continue
 
+        month = int(date_str[5:7])
+        df = df.copy()
         df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce").astype("float32")
         df = df.dropna(subset=["lmp"])
 
         dt = pd.to_datetime(df["interval_utc"], utc=True)
-        df = df.copy()
-        df["month"] = dt.dt.month.astype("int8")
-        df["slot"]  = ((dt.dt.hour * 60 + dt.dt.minute) // 5).astype("int16")
+        df["slot"] = ((dt.dt.hour * 60 + dt.dt.minute) // 5).astype("int16")
 
-        for (node_val, month_val, slot_val), grp in df.groupby(["node","month","slot"])["lmp"]:
-            acc[node_val][int(month_val)][int(slot_val)].extend(grp.tolist())
+        for node_val, grp in df.groupby("node"):
+            row = np.full(288, np.nan, dtype="float32")
+            row[grp["slot"].to_numpy()] = grp["lmp"].to_numpy()
+            acc[node_val][month].append(row)
 
         if i % 100 == 0:
             log.info("  Streamed %d / %d partitions", i, len(all_dates))
@@ -229,18 +233,25 @@ def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
     for node, months_data in acc.items():
         month_out = {}
         for month_num in range(1, 13):
-            slot_data = months_data.get(month_num, {})
-            avg_l, p10_l, p90_l = [], [], []
-            for slot_idx in range(288):
-                vals = slot_data.get(slot_idx, [])
-                if vals:
-                    arr = np.array(vals, dtype="float32")
-                    avg_l.append(round(float(arr.mean()), 2))
-                    p10_l.append(round(float(np.percentile(arr, 10)), 2))
-                    p90_l.append(round(float(np.percentile(arr, 90)), 2))
-                else:
-                    avg_l.append(None); p10_l.append(None); p90_l.append(None)
-            month_out[MONTH_ABBR[month_num - 1]] = {"avg": avg_l, "p10": p10_l, "p90": p90_l}
+            rows = months_data.get(month_num)
+            if not rows:
+                month_out[MONTH_ABBR[month_num - 1]] = {
+                    "avg": [None] * 288, "p10": [None] * 288, "p90": [None] * 288,
+                }
+                continue
+            mat = np.vstack(rows)  # shape: (n_days_in_month, 288)
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                # Some slots may have no data across every day in this month
+                # (all-NaN column) — that's expected and yields null below.
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                avg = np.nanmean(mat, axis=0)
+                p10 = np.nanpercentile(mat, 10, axis=0)
+                p90 = np.nanpercentile(mat, 90, axis=0)
+            month_out[MONTH_ABBR[month_num - 1]] = {
+                "avg": _round_list(avg),
+                "p10": _round_list(p10),
+                "p90": _round_list(p90),
+            }
         results[node] = {"slots": SLOT_LABELS, "months": month_out}
 
     return results
@@ -267,30 +278,16 @@ def main() -> None:
     # ── Seasonal: stream all partitions, accumulate per (node,month,slot) ────
     seasonal_by_node = compute_seasonal_streaming(all_dates)
 
-    # ── Geo-View: combine per-node seasonal averages into one payload ────────
+    # ── Upload seasonal + geo + meta now, before the lighter "recent" phase.
+    #    This is the slow, memory-heavy step — get its results (and a fresh
+    #    last_updated) onto R2 immediately so the site reflects them even if
+    #    the recent phase below fails. ────────────────────────────────────────
+    for node in nodes:
+        if node in seasonal_by_node:
+            upload_json(seasonal_by_node[node], f"summaries/{node}/seasonal.json")
+
     upload_json(compute_geo_seasonal(seasonal_by_node), "summaries/geo_seasonal.json")
 
-    # ── Recent: load last 35 days (small, fits easily in memory) ─────────────
-    log.info("Loading last %d partitions for recent summaries…", len(recent_dates))
-    recent_df = load_all(recent_dates)
-    if "lmp" in recent_df.columns:
-        recent_df["lmp"] = recent_df["lmp"].astype("float32")
-
-    # ── Per-node upload ───────────────────────────────────────────────────────
-    for i, node in enumerate(nodes, 1):
-        log.info("[%d/%d] Uploading %s", i, len(nodes), node)
-        prefix = f"summaries/{node}"
-
-        if node in seasonal_by_node:
-            upload_json(seasonal_by_node[node], f"{prefix}/seasonal.json")
-
-        node_recent = recent_df[recent_df["node"] == node] if not recent_df.empty else pd.DataFrame()
-        if not node_recent.empty:
-            upload_json(compute_rolling_7d(node_recent),      f"{prefix}/rolling_7d.json")
-            upload_json(compute_monthly_avg(node_recent),     f"{prefix}/monthly_avg.json")
-            upload_json(compute_recent_actuals(node_recent),  f"{prefix}/recent_actuals.json")
-
-    # ── Global meta ───────────────────────────────────────────────────────────
     meta = {
         "earliest":    all_dates[0],
         "latest":      all_dates[-1],
@@ -299,7 +296,31 @@ def main() -> None:
         "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     upload_json(meta, "summaries/meta.json")
-    log.info("Done. Uploaded summaries for %d nodes.", len(nodes))
+    log.info("Seasonal/geo/meta uploaded for %d nodes.", len(nodes))
+
+    # Free the large seasonal accumulation before loading recent data.
+    del seasonal_by_node
+
+    # ── Recent: load last 35 days (small, fits easily in memory) ─────────────
+    try:
+        log.info("Loading last %d partitions for recent summaries…", len(recent_dates))
+        recent_df = load_all(recent_dates)
+        if "lmp" in recent_df.columns:
+            recent_df["lmp"] = recent_df["lmp"].astype("float32")
+
+        for i, node in enumerate(nodes, 1):
+            node_recent = recent_df[recent_df["node"] == node] if not recent_df.empty else pd.DataFrame()
+            if not node_recent.empty:
+                prefix = f"summaries/{node}"
+                upload_json(compute_rolling_7d(node_recent),      f"{prefix}/rolling_7d.json")
+                upload_json(compute_monthly_avg(node_recent),     f"{prefix}/monthly_avg.json")
+                upload_json(compute_recent_actuals(node_recent),  f"{prefix}/recent_actuals.json")
+            if i % 25 == 0:
+                log.info("  Recent summaries uploaded for %d / %d nodes", i, len(nodes))
+
+        log.info("Done. Recent summaries uploaded for %d nodes.", len(nodes))
+    except Exception:
+        log.exception("Recent-data summary phase failed; seasonal/geo/meta were already updated.")
 
 
 if __name__ == "__main__":
