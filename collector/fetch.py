@@ -8,9 +8,11 @@ Run manually:       python collector/fetch.py
 Run on a schedule:  use cron, APScheduler, or Render Cron Job
 """
 
+import io
 import os
 import sys
 import logging
+import ijson
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -59,40 +61,81 @@ log = logging.getLogger(__name__)
 
 # ── Core fetch logic ─────────────────────────────────────────────────────────
 
+# JSON paths to try (in order) for the records array within the response body.
+# MISO has used both a top-level array and various wrapper-key shapes.
+_RECORD_PATHS = ("data.item", "Data.item", "items.item", "Items.item",
+                  "result.item", "Result.item", "item")
+
+
+def _stream_indiana_records(content: bytes) -> list | None:
+    """Stream-parse the JSON body, keeping only Indiana-prefixed records.
+
+    The MISO-wide response covers ~2,600 nodes and grows through the market
+    day (intervals are added as they're approved) — late in the day it's
+    large enough that fully materializing it with json.loads/resp.json()
+    risks OOM on a 512MB worker. ijson parses incrementally so only the
+    ~108 Indiana records we actually keep ever live in memory.
+
+    Returns None if no known path matches the response shape, so the caller
+    can fall back to a full parse (e.g. if MISO changes the response shape).
+    """
+    for path in _RECORD_PATHS:
+        try:
+            records = []
+            seen = False
+            for rec in ijson.items(io.BytesIO(content), path, use_float=True):
+                seen = True
+                if isinstance(rec, (list, tuple)):
+                    node = str(rec[1]) if len(rec) > 1 else ""
+                elif isinstance(rec, dict):
+                    node = str(rec.get(1, rec.get("1", "")))
+                else:
+                    node = ""
+                if node.split(".")[0] in INDIANA_PREFIXES:
+                    records.append(rec)
+            if seen:
+                return records
+        except Exception:
+            continue
+    return None
+
+
 def fetch_rolling() -> pd.DataFrame:
     """Download the current rolling market day from MISO and return a clean DataFrame."""
     log.info("Fetching rolling LMP data from MISO …")
     try:
-        resp = requests.get(ROLLING_URL, timeout=30)
+        resp = requests.get(ROLLING_URL, timeout=60)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.error("Request failed: %s", e)
         raise
 
-    payload = resp.json()
+    records = _stream_indiana_records(resp.content)
 
-    # MISO wraps the data in different keys depending on the endpoint version.
-    # Try common wrapper keys; fall back to treating the root as a list.
-    if isinstance(payload, list):
-        records = payload
-    elif isinstance(payload, dict):
-        for key in ("data", "Data", "items", "Items", "result", "Result"):
-            if key in payload:
-                records = payload[key]
-                break
+    if records is None:
+        log.warning("Streaming parse found no known response shape; falling back to full parse.")
+        payload = resp.json()
+        # MISO wraps the data in different keys depending on the endpoint version.
+        # Try common wrapper keys; fall back to treating the root as a list.
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict):
+            for key in ("data", "Data", "items", "Items", "result", "Result"):
+                if key in payload:
+                    records = payload[key]
+                    break
+            else:
+                log.warning("Unexpected response shape. Keys: %s", list(payload.keys()))
+                records = []
         else:
-            # If we can't find a list, surface the raw response for inspection.
-            log.warning("Unexpected response shape. Keys: %s", list(payload.keys()))
             records = []
-    else:
-        records = []
 
     if not records:
         log.warning("No records returned. The API response may have changed.")
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    log.info("Raw response: %d rows, columns: %s", len(df), list(df.columns))
+    log.info("Indiana-filtered response: %d rows, columns: %s", len(df), list(df.columns))
     return df
 
 

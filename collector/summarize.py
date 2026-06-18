@@ -6,10 +6,11 @@ computes pre-aggregated JSON summaries, and uploads them to R2 under
 summaries/<node>/<type>.json for direct browser consumption.
 
 Summary types (per node, all 109 Indiana nodes):
-  seasonal.json     — avg, P10, P90 LMP by (month × 5-min slot) across all years
-  rolling_7d.json   — last 30 days of raw + 7-day rolling average per interval
-  monthly_avg.json  — avg, P25, P75 LMP by 5-min slot for the current month
-  recent_actuals.json — last 7 days of raw 5-min LMP + congestion
+  seasonal.json          — avg, P10, P90 LMP by (month × 5-min slot) across all years
+  rolling_7d.json        — last 30 days of raw + 7-day rolling average per interval
+  monthly_by_period.json — avg, P25, P75 LMP by 5-min slot for every (year, month)
+    that has data, so the site can let users pick a specific month and year
+  recent_actuals.json    — last 7 days of raw 5-min LMP + congestion
 
 Global:
   summaries/meta.json — node list, date range, last_updated timestamp
@@ -19,10 +20,10 @@ Global:
 Scheduled to run nightly ~2am via Render cron job.
 """
 
+import gc
 import logging
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -44,7 +45,11 @@ log = logging.getLogger(__name__)
 SLOT_LABELS = [f"{h:02d}:{m:02d}" for h in range(24) for m in range(0, 60, 5)]
 MONTH_ABBR  = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-RECENT_DAYS   = 35   # days to load for rolling/monthly/actuals
+RECENT_DAYS           = 35   # days of data shown for rolling/monthly/actuals
+ROLLING_LOOKBACK_DAYS = 7     # extra trailing days loaded just to seed the
+                              # 7-day rolling average so it has full context
+                              # at the left edge of the displayed window
+                              # instead of tapering toward the raw value
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -56,25 +61,6 @@ def _load_one(date_str: str) -> pd.DataFrame:
     # Keep only the columns we need
     keep = [c for c in ["node", "interval_utc", "lmp", "congestion"] if c in df.columns]
     return df[keep]
-
-
-def load_all(dates: list[str], workers: int = 10) -> pd.DataFrame:
-    """Download and concat all partitions in parallel."""
-    log.info("Loading %d partitions (up to %d parallel)…", len(dates), workers)
-    frames = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_load_one, d): d for d in dates}
-        for i, future in enumerate(as_completed(futures), 1):
-            df = future.result()
-            if not df.empty:
-                frames.append(df)
-            if i % 100 == 0:
-                log.info("  Loaded %d / %d partitions", i, len(dates))
-    if not frames:
-        return pd.DataFrame()
-    combined = pd.concat(frames, ignore_index=True)
-    log.info("  Total rows loaded: %d", len(combined))
-    return combined
 
 
 # ── Slot helpers ──────────────────────────────────────────────────────────────
@@ -116,8 +102,15 @@ def compute_seasonal(df: pd.DataFrame) -> dict:
     return {"slots": SLOT_LABELS, "months": out}
 
 
-def compute_rolling_7d(df: pd.DataFrame) -> dict:
-    """Per-interval 7-day rolling average for the last 30 days of data."""
+def compute_rolling_7d(df: pd.DataFrame, display_days: int = RECENT_DAYS) -> dict:
+    """Per-interval 7-day rolling average for the last `display_days` days.
+
+    `df` is expected to include ROLLING_LOOKBACK_DAYS of data *before* the
+    display window. Without that lookback, the rolling average for the
+    earliest displayed days would only have 1-6 days of history to average
+    over instead of a true trailing 7 days — visible as the line tapering
+    toward the raw value at the left edge of the chart.
+    """
     df = df.copy()
     df["interval_utc"] = pd.to_datetime(df["interval_utc"], utc=True)
     df = df.sort_values("interval_utc")
@@ -129,34 +122,15 @@ def compute_rolling_7d(df: pd.DataFrame) -> dict:
         .mean()
     )
 
+    # Drop the lookback buffer now that it's done its job of seeding the
+    # rolling window — only the display window actually gets plotted.
+    cutoff = df["interval_utc"].max() - pd.Timedelta(days=display_days)
+    df = df[df["interval_utc"] > cutoff]
+
     return {
         "timestamps": df["interval_utc"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist(),
         "lmp":        _round_list(df["lmp"]),
         "rolling_7d": _round_list(df["rolling_7d"]),
-    }
-
-
-def compute_monthly_avg(df: pd.DataFrame) -> dict:
-    """Average, P25, P75 LMP by 5-min slot for the current calendar month."""
-    now = datetime.now(timezone.utc)
-    month_str = now.strftime("%Y-%m")
-
-    df = df.copy()
-    df["interval_utc"] = pd.to_datetime(df["interval_utc"], utc=True)
-    month_df = df[df["interval_utc"].dt.strftime("%Y-%m") == month_str]
-    month_df = add_slot(month_df)
-
-    grp = month_df.groupby("slot")["lmp"]
-    avg = grp.mean().reindex(range(288))
-    p25 = grp.quantile(0.25).reindex(range(288))
-    p75 = grp.quantile(0.75).reindex(range(288))
-
-    return {
-        "month":  month_str,
-        "slots":  SLOT_LABELS,
-        "avg":    _round_list(avg),
-        "p25":    _round_list(p25),
-        "p75":    _round_list(p75),
     }
 
 
@@ -180,25 +154,26 @@ def _round_list(series: pd.Series, decimals: int = 2) -> list:
     return [round(float(v), decimals) if pd.notna(v) else None for v in series]
 
 
-def compute_geo_seasonal(seasonal_by_node: dict[str, dict]) -> dict:
-    """Combine per-node seasonal averages into a single payload for the
-    Geo-View map: avg LMP by (month x slot) for every node, keyed by node."""
-    nodes = {
-        node: {m: data["months"][m]["avg"] for m in MONTH_ABBR}
-        for node, data in seasonal_by_node.items()
-    }
-    return {"slots": SLOT_LABELS, "nodes": nodes}
-
-
 # ── Streaming seasonal aggregation ───────────────────────────────────────────
 
-def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
-    """Compute seasonal avg/P10/P90 per node by streaming one partition at a time.
+def compute_seasonal_streaming(all_dates: list[str], valid_nodes: set[str]) -> dict[str, dict]:
+    """Compute seasonal avg/P10/P90 per node by streaming one partition at a
+    time, uploading each node's seasonal.json as soon as it's computed.
 
     For each (node, month), accumulates one 288-slot row per day (a small
     float32 array) rather than every raw reading individually — this keeps
     memory roughly proportional to (nodes x months x days), not total rows,
-    which matters once the store spans years of 5-minute data."""
+    which matters once the store spans years of 5-minute data.
+
+    `valid_nodes` restricts output to the current node set (discovered from
+    the latest partition in main()) — older partitions can contain retired
+    or since-renamed node names that would otherwise leave orphaned summary
+    files in R2 with no corresponding entry in meta.json or node_coords.json.
+
+    Returns the much smaller avg-only geo_nodes dict (used for the combined
+    Geo-View payload) rather than the full per-node results — the caller
+    never needs the full per-month avg/P10/P90 data again once it's uploaded.
+    """
     from collections import defaultdict
 
     # acc[node][month] = [row, ...] where each row is a 288-slot float32 array
@@ -219,6 +194,8 @@ def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
         df["slot"] = ((dt.dt.hour * 60 + dt.dt.minute) // 5).astype("int16")
 
         for node_val, grp in df.groupby("node"):
+            if node_val not in valid_nodes:
+                continue
             row = np.full(288, np.nan, dtype="float32")
             row[grp["slot"].to_numpy()] = grp["lmp"].to_numpy()
             acc[node_val][month].append(row)
@@ -228,12 +205,18 @@ def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
 
     log.info("Seasonal accumulation done. Computing stats…")
 
-    # Convert to per-node seasonal dicts
-    results: dict[str, dict] = {}
-    for node, months_data in acc.items():
+    # Convert to per-node seasonal dicts and upload immediately, node by
+    # node, rather than building a full results dict first — that dict
+    # would otherwise sit in memory alongside the (still-shrinking) acc
+    # for the whole conversion pass. Also build the much smaller geo_nodes
+    # (avg only) dict to return for the combined Geo-View payload.
+    geo_nodes: dict[str, dict] = {}
+    node_keys = list(acc.keys())
+    for node in node_keys:
+        months_data = acc.pop(node)
         month_out = {}
         for month_num in range(1, 13):
-            rows = months_data.get(month_num)
+            rows = months_data.pop(month_num, None)
             if not rows:
                 month_out[MONTH_ABBR[month_num - 1]] = {
                     "avg": [None] * 288, "p10": [None] * 288, "p90": [None] * 288,
@@ -252,9 +235,87 @@ def compute_seasonal_streaming(all_dates: list[str]) -> dict[str, dict]:
                 "p10": _round_list(p10),
                 "p90": _round_list(p90),
             }
-        results[node] = {"slots": SLOT_LABELS, "months": month_out}
+        upload_json({"slots": SLOT_LABELS, "months": month_out}, f"summaries/{node}/seasonal.json")
+        geo_nodes[node] = {m: month_out[m]["avg"] for m in MONTH_ABBR}
 
-    return results
+    return geo_nodes
+
+
+# ── Streaming monthly-by-period aggregation ──────────────────────────────────
+
+def compute_monthly_by_period_streaming(all_dates: list[str], valid_nodes: set[str]) -> None:
+    """Compute avg/P25/P75 per node for every distinct calendar (year, month)
+    that has data, streaming one partition at a time, and upload each node's
+    result to R2 as soon as it's computed (see note below on why).
+
+    `valid_nodes` restricts output to the current node set — see
+    compute_seasonal_streaming's docstring for why that filter matters.
+
+    Same memory rationale as compute_seasonal_streaming above for the
+    accumulation phase, just bucketed by "YYYY-MM" instead of
+    month-across-all-years. Powers the Monthly Profile chart's year/month
+    picker. Must run as its own pass, after the seasonal accumulator has
+    been freed, rather than alongside it — holding both full-history
+    accumulators in memory at once would roughly double peak RSS."""
+    from collections import defaultdict
+
+    # acc[node][period] = [row, ...] where period is "YYYY-MM" and each row
+    # is a 288-slot float32 array
+    acc: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+
+    log.info("Streaming %d partitions for monthly-by-period aggregation…", len(all_dates))
+    for i, date_str in enumerate(all_dates, 1):
+        df = load_date(date_str)
+        if df.empty:
+            continue
+
+        period = date_str[:7]  # "YYYY-MM"
+        df = df.copy()
+        df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce").astype("float32")
+        df = df.dropna(subset=["lmp"])
+
+        dt = pd.to_datetime(df["interval_utc"], utc=True)
+        df["slot"] = ((dt.dt.hour * 60 + dt.dt.minute) // 5).astype("int16")
+
+        for node_val, grp in df.groupby("node"):
+            if node_val not in valid_nodes:
+                continue
+            row = np.full(288, np.nan, dtype="float32")
+            row[grp["slot"].to_numpy()] = grp["lmp"].to_numpy()
+            acc[node_val][period].append(row)
+
+        if i % 100 == 0:
+            log.info("  Streamed %d / %d partitions", i, len(all_dates))
+
+    log.info("Monthly-by-period accumulation done. Computing stats…")
+
+    # Upload each node's payload immediately rather than building one big
+    # results dict first — this one has ~3.5x more (node, period) entries
+    # than the seasonal equivalent (every year-month vs. just 12 months),
+    # so holding it all in memory at once is the difference between this
+    # job fitting in Render's 512MB budget and OOMing.
+    node_keys = list(acc.keys())
+    for node in node_keys:
+        periods_data = acc.pop(node)
+        by_period = {}
+        for period in sorted(periods_data.keys()):
+            rows = periods_data.pop(period)
+            mat = np.vstack(rows)  # shape: (n_days_in_period, 288)
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                avg = np.nanmean(mat, axis=0)
+                p25 = np.nanpercentile(mat, 25, axis=0)
+                p75 = np.nanpercentile(mat, 75, axis=0)
+            by_period[period] = {
+                "avg": _round_list(avg),
+                "p25": _round_list(p25),
+                "p75": _round_list(p75),
+            }
+        upload_json({
+            "slots": SLOT_LABELS,
+            "periods": sorted(by_period.keys()),
+            "by_period": by_period,
+        }, f"summaries/{node}/monthly_by_period.json")
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -265,29 +326,28 @@ def main() -> None:
         sys.exit(1)
 
     all_dates    = available_dates()
-    recent_dates = all_dates[-RECENT_DAYS:]
+    recent_dates = all_dates[-(RECENT_DAYS + ROLLING_LOOKBACK_DAYS):]
 
-    log.info("Store: %d total dates, using last %d for recent summaries",
-             len(all_dates), len(recent_dates))
+    log.info("Store: %d total dates, using last %d (%d display + %d rolling lookback)",
+             len(all_dates), len(recent_dates), RECENT_DAYS, ROLLING_LOOKBACK_DAYS)
 
     # ── Discover nodes from a sample ─────────────────────────────────────────
     sample = load_date(all_dates[-1])
     nodes = sorted(sample["node"].unique().tolist()) if not sample.empty else []
     log.info("Nodes: %d", len(nodes))
 
-    # ── Seasonal: stream all partitions, accumulate per (node,month,slot) ────
-    seasonal_by_node = compute_seasonal_streaming(all_dates)
+    # ── Seasonal: stream all partitions, accumulate per (node,month,slot),
+    # and upload each node's seasonal.json as soon as it's computed (inside
+    # the function) rather than collecting a full results dict here first.
+    # Returns just the small avg-only geo_nodes dict for the combined
+    # Geo-View payload. ───────────────────────────────────────────────────
+    geo_nodes = compute_seasonal_streaming(all_dates, set(nodes))
+    upload_json({"slots": SLOT_LABELS, "nodes": geo_nodes}, "summaries/geo_seasonal.json")
+    del geo_nodes
+    gc.collect()
 
-    # ── Upload seasonal + geo + meta now, before the lighter "recent" phase.
-    #    This is the slow, memory-heavy step — get its results (and a fresh
-    #    last_updated) onto R2 immediately so the site reflects them even if
-    #    the recent phase below fails. ────────────────────────────────────────
-    for node in nodes:
-        if node in seasonal_by_node:
-            upload_json(seasonal_by_node[node], f"summaries/{node}/seasonal.json")
-
-    upload_json(compute_geo_seasonal(seasonal_by_node), "summaries/geo_seasonal.json")
-
+    # meta.json goes up now too, before the lighter "recent" phase, so the
+    # site reflects a fresh last_updated even if the recent phase fails.
     meta = {
         "earliest":    all_dates[0],
         "latest":      all_dates[-1],
@@ -298,22 +358,51 @@ def main() -> None:
     upload_json(meta, "summaries/meta.json")
     log.info("Seasonal/geo/meta uploaded for %d nodes.", len(nodes))
 
-    # Free the large seasonal accumulation before loading recent data.
-    del seasonal_by_node
+    # ── Monthly-by-period: a second full streaming pass, run only after the
+    # seasonal accumulator above is freed so the two never overlap in memory.
+    # Partitions are already cached on local disk from the seasonal pass, so
+    # this doesn't re-hit R2 — just re-reads local Parquet files. Uploads
+    # per node internally (same reasoning as compute_seasonal_streaming) —
+    # this one has ~3.5x more (node, period) entries than seasonal's, so
+    # collecting a full results dict here first would be the difference
+    # between fitting in Render's 512MB budget and OOMing.
+    compute_monthly_by_period_streaming(all_dates, set(nodes))
+    log.info("Monthly-by-period uploaded for %d nodes.", len(nodes))
+    gc.collect()
 
-    # ── Recent: load last 35 days (small, fits easily in memory) ─────────────
+    # ── Recent: stream one partition at a time into per-node buffers ─────────
+    # load_all() used to download all 35 days in parallel and pd.concat them
+    # into one big DataFrame — that holds the full 35-day x all-nodes dataset
+    # twice (the per-date frames list, then the concat result) at once, which
+    # is what pushed this job over Render's 512MB limit once the store grew to
+    # 1000+ partitions. Streaming bounds memory to ~(nodes x recent_days)
+    # small per-node slices instead, and these partitions are already cached
+    # on local disk from the seasonal phase above, so no extra R2 downloads.
     try:
-        log.info("Loading last %d partitions for recent summaries…", len(recent_dates))
-        recent_df = load_all(recent_dates)
-        if "lmp" in recent_df.columns:
-            recent_df["lmp"] = recent_df["lmp"].astype("float32")
+        log.info("Streaming %d recent partitions for per-node summaries…", len(recent_dates))
+        node_set = set(nodes)
+        node_frames: dict[str, list] = {n: [] for n in nodes}
+
+        for j, date_str in enumerate(recent_dates, 1):
+            df = _load_one(date_str)
+            if df.empty:
+                continue
+            if "lmp" in df.columns:
+                df = df.copy()
+                df["lmp"] = pd.to_numeric(df["lmp"], errors="coerce").astype("float32")
+            keep = [c for c in ["interval_utc", "lmp", "congestion"] if c in df.columns]
+            for node_val, grp in df.groupby("node"):
+                if node_val in node_set:
+                    node_frames[node_val].append(grp[keep].reset_index(drop=True))
+            if j % 10 == 0:
+                log.info("  Streamed %d / %d recent partitions", j, len(recent_dates))
 
         for i, node in enumerate(nodes, 1):
-            node_recent = recent_df[recent_df["node"] == node] if not recent_df.empty else pd.DataFrame()
-            if not node_recent.empty:
+            frames = node_frames.pop(node, [])  # pop to free as we go
+            if frames:
+                node_recent = pd.concat(frames, ignore_index=True)
                 prefix = f"summaries/{node}"
                 upload_json(compute_rolling_7d(node_recent),      f"{prefix}/rolling_7d.json")
-                upload_json(compute_monthly_avg(node_recent),     f"{prefix}/monthly_avg.json")
                 upload_json(compute_recent_actuals(node_recent),  f"{prefix}/recent_actuals.json")
             if i % 25 == 0:
                 log.info("  Recent summaries uploaded for %d / %d nodes", i, len(nodes))

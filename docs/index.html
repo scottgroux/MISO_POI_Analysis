@@ -99,7 +99,13 @@
 
 <div id="panel-monthly" class="panel">
   <div class="chart-wrap">
-    <p class="chart-desc">Average LMP by time-of-day for the current calendar month, with P25–P75 interquartile band showing the typical price range.</p>
+    <p class="chart-desc">Average LMP by time-of-day for the selected month and year, with P25–P75 interquartile band showing the typical price range.</p>
+    <div class="geo-controls">
+      <label for="monthly-year-select">Year</label>
+      <select id="monthly-year-select"></select>
+      <label for="monthly-month-select">Month</label>
+      <select id="monthly-month-select"></select>
+    </div>
     <div id="chart-monthly" style="height:360px"></div>
   </div>
 </div>
@@ -178,19 +184,21 @@ async function loadNode(node) {
 
   try {
     const base = `${R2_BASE}/summaries/${node}`;
-    const [seasonal, rolling, monthly, actuals] = await Promise.all([
+    const [seasonal, rolling, monthlyByPeriod, actuals] = await Promise.all([
       fetchJSON(`${base}/seasonal.json`),
       fetchJSON(`${base}/rolling_7d.json`),
-      fetchJSON(`${base}/monthly_avg.json`),
+      fetchJSON(`${base}/monthly_by_period.json`),
       fetchJSON(`${base}/recent_actuals.json`),
     ]);
 
     window._seasonal = seasonal;
+    window._monthlyByPeriod = monthlyByPeriod;
 
     renderHeatmap(seasonal, node);
     renderBand(seasonal, $("band-month-select").value);
     renderRolling(rolling, node);
-    renderMonthly(monthly, node);
+    initMonthlyControls(monthlyByPeriod);
+    renderMonthlyByPeriod();
     renderActuals(actuals, node);
     if (window._geoLoaded) renderGeoView();
 
@@ -215,8 +223,12 @@ function renderHeatmap(data, node) {
   Plotly.react("chart-heatmap", [{
     type: "heatmap",
     z, x: slots, y: MONTHS,
-    colorscale: "RdYlGn_r",
-    colorbar: { title: "$/MWh", thickness: 14 },
+    colorscale: GEO_COLORSCALE, zmin: GEO_CMIN, zmax: GEO_CMAX,
+    colorbar: {
+      title: "$/MWh", thickness: 14,
+      tickvals: [GEO_CMIN, 0, 125, 250, 375, GEO_CMAX],
+      ticktext: ["<0", "0", "125", "250", "375", "500+"],
+    },
     hovertemplate: "%{y} %{x}<br>Avg LMP: $%{z:.2f}/MWh<extra></extra>",
   }], {
     title: { text: `Seasonal LMP Heatmap — ${node}`, font: { size: 14 } },
@@ -268,7 +280,10 @@ function renderRolling(data, node) {
   ], {
     title: { text: `7-Day Rolling Average — ${node}`, font: { size: 14 } },
     xaxis: { title: "Date (UTC)" },
-    yaxis: { title: "$/MWh" },
+    // Clip the autoranged max at $100 so an occasional price spike in the
+    // raw 5-min trace doesn't flatten the rolling-average line — the axis
+    // still autoranges normally (including negative dips) otherwise.
+    yaxis: { title: "$/MWh", autorangeoptions: { clipmax: 100 } },
     legend: { orientation:"h", y:-0.2 },
     margin: { l: 60, r: 20, t: 50, b: 60 },
     hovermode: "x unified",
@@ -277,6 +292,9 @@ function renderRolling(data, node) {
 
 function renderMonthly(data, node) {
   const slots = data.slots;
+  const [y, m] = data.month.split("-");
+  const label = `${MONTHS[+m - 1]} ${y}`;
+
   Plotly.react("chart-monthly", [
     { x: slots, y: data.p75, mode:"lines", line:{width:0}, name:"P75", showlegend:false },
     {
@@ -288,13 +306,58 @@ function renderMonthly(data, node) {
     { x: slots, y: data.avg, mode:"lines", line:{color:"#059669",width:2.5}, name:"Avg LMP" },
     { x: slots, y: data.p25, mode:"lines", line:{width:0}, name:"P25", showlegend:false },
   ], {
-    title: { text: `Monthly Average (${data.month}) — ${node}`, font: { size: 14 } },
+    title: { text: `Monthly Average (${label}) — ${node}`, font: { size: 14 } },
     xaxis: { title: "Time of Day (UTC)", nticks: 24 },
     yaxis: { title: "$/MWh" },
     legend: { orientation:"h", y:-0.2 },
     margin: { l: 60, r: 20, t: 50, b: 60 },
     hovermode: "x unified",
   }, PLOTLY_CFG);
+}
+
+// Builds the Year/Month dropdowns for the Monthly Profile tab from the set
+// of (year, month) periods this node actually has data for, preserving the
+// user's current selection across node switches when possible.
+function initMonthlyControls(data) {
+  const periods = data.periods || [];
+  const years = [...new Set(periods.map(p => p.slice(0, 4)))].sort();
+  const nowYear  = String(new Date().getUTCFullYear());
+  const nowMonth = String(new Date().getUTCMonth() + 1).padStart(2, "0");
+
+  const ys = $("monthly-year-select");
+  const prevYear = ys.value;
+  ys.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join("");
+  ys.value = years.includes(prevYear) ? prevYear
+           : years.includes(nowYear)  ? nowYear
+           : years[years.length - 1];
+
+  function populateMonths() {
+    const year = ys.value;
+    const monthsForYear = periods.filter(p => p.startsWith(year + "-")).map(p => p.slice(5, 7));
+    const ms = $("monthly-month-select");
+    const prevMonth = ms.value;
+    ms.innerHTML = monthsForYear.map(m => `<option value="${m}">${MONTHS[+m - 1]}</option>`).join("");
+    ms.value = monthsForYear.includes(prevMonth) ? prevMonth
+             : (year === nowYear && monthsForYear.includes(nowMonth)) ? nowMonth
+             : monthsForYear[monthsForYear.length - 1];
+  }
+  populateMonths();
+
+  ys.onchange = () => { populateMonths(); renderMonthlyByPeriod(); };
+  $("monthly-month-select").onchange = renderMonthlyByPeriod;
+}
+
+function renderMonthlyByPeriod() {
+  const data = window._monthlyByPeriod;
+  if (!data) return;
+  const period = `${$("monthly-year-select").value}-${$("monthly-month-select").value}`;
+  const stats = data.by_period[period];
+  const node = $("node-select").value;
+  if (!stats) {
+    showError(`No Monthly Profile data for ${period}`);
+    return;
+  }
+  renderMonthly({ slots: data.slots, month: period, ...stats }, node);
 }
 
 function renderActuals(data, node) {
@@ -308,20 +371,52 @@ function renderActuals(data, node) {
       x: data.timestamps, y: data.congestion,
       mode:"lines", name:"Congestion",
       line:{color:"#ff7f0e", width:1, dash:"dot"},
+      yaxis: "y2",
     });
   }
 
   Plotly.react("chart-actuals", traces, {
     title: { text: `Recent Actuals (last 7 days) — ${node}`, font: { size: 14 } },
     xaxis: { title: "Interval (UTC)" },
-    yaxis: { title: "$/MWh" },
+    yaxis: { title: "LMP ($/MWh)" },
+    // Congestion gets its own scale — its magnitude is usually much smaller
+    // than LMP, so sharing one axis flattens it to a near-invisible line.
+    yaxis2: {
+      title: "Congestion ($/MWh)", overlaying: "y", side: "right",
+      showgrid: false, zeroline: true,
+    },
     legend: { orientation:"h", y:-0.2 },
-    margin: { l: 60, r: 20, t: 50, b: 60 },
+    margin: { l: 60, r: 60, t: 50, b: 60 },
     hovermode: "x unified",
   }, PLOTLY_CFG);
 }
 
 // ── Geo-View ──────────────────────────────────────────────────────────────────
+
+// Static price scale (fixed regardless of month/time selected, so the same
+// color always means the same $/MWh). Values below GEO_CMIN or above
+// GEO_CMAX are outliers — Plotly clamps them to the boundary color rather
+// than stretching the gradient, so they read as flat purple / flat red
+// instead of distorting the scale for everything else.
+const GEO_CMIN = -1;
+const GEO_CMAX = 500;
+const GEO_COLORSCALE = (() => {
+  const span = GEO_CMAX - GEO_CMIN;
+  const zero = (0 - GEO_CMIN) / span;          // position of $0 on the scale
+  const step = (1 - zero) / 4;                  // blue→green→yellow→orange→red, evenly spaced over $0–$500
+  return [
+    [0,              "#7b2cbf"],  // purple — negative (outlier, flat)
+    [zero - 0.001,   "#7b2cbf"],
+    [zero,           "#1f78d1"],  // blue   — $0
+    [zero + step,    "#2ca02c"],  // green
+    [zero + step * 2,"#f1c40f"],  // yellow
+    [zero + step * 3,"#e67e22"],  // orange
+    [1,              "#c0392b"],  // red    — $500+ (outlier, flat)
+  ];
+})();
+const GEO_MARKER_COMMON = {
+  colorscale: GEO_COLORSCALE, cmin: GEO_CMIN, cmax: GEO_CMAX,
+};
 
 async function ensureGeoLoaded() {
   if (window._geoLoaded) return;
@@ -388,21 +483,22 @@ function renderGeoView() {
     }
   }
 
-  const allVals = hVal != null ? vals.concat(hVal) : vals;
-  if (allVals.length === 0) {
+  if (vals.length === 0 && hVal == null) {
     showError(`No Geo-View data for ${month} @ ${SLOT_LABELS[slot]} UTC`);
     return;
   }
-  const cmin = Math.min(...allVals);
-  const cmax = Math.max(...allVals);
 
   const traces = [{
     type: "scattermapbox",
     lat: lats, lon: lons,
     mode: "markers",
     marker: {
-      size: 11, color: vals, colorscale: "RdYlGn_r", cmin, cmax,
-      colorbar: { title: "$/MWh", thickness: 14 },
+      size: 11, color: vals, ...GEO_MARKER_COMMON,
+      colorbar: {
+        title: "$/MWh", thickness: 14,
+        tickvals: [GEO_CMIN, 0, 125, 250, 375, GEO_CMAX],
+        ticktext: ["<0", "0", "125", "250", "375", "500+"],
+      },
     },
     text: texts,
     hovertemplate: "%{text}<br>$%{marker.color:.2f}/MWh<extra></extra>",
@@ -414,7 +510,7 @@ function renderGeoView() {
       lat: [hLat], lon: [hLon],
       mode: "markers",
       marker: {
-        size: 22, color: [hVal], colorscale: "RdYlGn_r", cmin, cmax,
+        size: 22, color: [hVal], ...GEO_MARKER_COMMON,
         showscale: false, line: { width: 2, color: "#1a1a2e" },
       },
       text: [hText],

@@ -5,6 +5,7 @@
 requests>=2.31.0
 pandas>=2.1.0
 pyarrow>=14.0.0       # Parquet read/write backend
+ijson>=3.2.0          # streaming JSON parse — keeps MISO-wide API response off the heap
 
 # Cloudflare R2 (S3-compatible object storage)
 boto3>=1.34.0
